@@ -27,6 +27,8 @@ dependencies:
   path: ^1.9.0
   # 设备信息 (CPU ABI)
   device_info_plus: ^10.1.0
+  # SHA256 完整性校验
+  crypto: ^3.0.3
 
 dev_dependencies:
   flutter_test:
