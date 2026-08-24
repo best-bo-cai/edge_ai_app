@@ -21,7 +21,7 @@ class ModelDetailScreen extends StatefulWidget {
 }
 
 class _ModelDetailScreenState extends State<ModelDetailScreen> {
-  final HfApiService _api = HfApiService();
+  final HfApiService _api = HfApiService.instance;
   final ModelService _modelService = ModelService();
 
   DeviceCapability? _capability;
@@ -124,7 +124,7 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
       await _modelService.switchModelByPath(savePath);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('模型已加载，前往对话页开始体验吧')),
+          const SnackBar(content: Text('模型已设为默认，重启应用后生效')),
         );
       }
     } catch (e) {

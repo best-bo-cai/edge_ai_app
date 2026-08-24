@@ -20,7 +20,7 @@ class ModelMarketScreen extends StatefulWidget {
 }
 
 class _ModelMarketScreenState extends State<ModelMarketScreen> {
-  final HfApiService _api = HfApiService();
+  final HfApiService _api = HfApiService.instance;
   final ModelService _modelService = ModelService();
   final ScrollController _scrollCtrl = ScrollController();
   final TextEditingController _searchCtrl = TextEditingController();

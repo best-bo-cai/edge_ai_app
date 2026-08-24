@@ -19,6 +19,9 @@ class HfApiService {
   static const String mirrorHost = 'https://hf-mirror.com';
   static const String _hostPrefKey = 'hf_active_host';
 
+  /// 全局单例：镜像状态（activeHost）跨页面共享；测试可继续用构造函数注入自定义 Dio
+  static final HfApiService instance = HfApiService();
+
   final Dio _dio;
   String activeHost = officialHost;
 
