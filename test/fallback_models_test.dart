@@ -51,4 +51,23 @@ void main() {
   test('损坏 JSON 返回空列表（不抛异常）', () {
     expect(ModelService.parseFallbackJson('not json'), isEmpty);
   });
+
+  test('models 非数组返回空列表', () {
+    expect(ModelService.parseFallbackJson('{"models": 42}'), isEmpty);
+  });
+
+  test('单条坏数据跳过，其余条目保留（逐条容错）', () {
+    const raw = '''
+    { "models": [
+      { "id": "good/one-GGUF",
+        "files": [ { "path": "one-q4_k_m.gguf", "size": 100 } ] },
+      { "downloads": "缺少 id 字段" },
+      12345,
+      { "id": "good/two-GGUF",
+        "files": [ { "path": "two-q4_k_m.gguf", "size": 200 } ] }
+    ] }
+    ''';
+    final models = ModelService.parseFallbackJson(raw);
+    expect(models.map((m) => m.id), ['good/one-GGUF', 'good/two-GGUF']);
+  });
 }

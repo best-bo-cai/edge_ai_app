@@ -98,8 +98,8 @@ class HfModelFile {
       repoId: repoId,
       path: json['path'] as String,
       sizeBytes: ((lfs?['size'] ?? json['size'] ?? 0) as num).toInt(),
-      // HF API 树接口用 lfs.oid；兜底清单用顶层 sha256 字段
-      sha256: (lfs?['oid'] ?? json['sha256']) as String?,
+      // HF API 树接口用 lfs.oid；兜底清单用顶层 sha256 字段（防御非字符串脏数据）
+      sha256: (lfs?['oid'] ?? json['sha256'])?.toString(),
     );
   }
 }

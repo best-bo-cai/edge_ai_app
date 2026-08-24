@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -101,22 +102,37 @@ class ModelService {
   static const String _fallbackAssetPath = 'assets/data/fallback_models.json';
 
   /// 解析兜底清单 JSON（需求 3.1）
+  /// 逐条容错：单条坏数据仅跳过该条并记录日志，不影响其余条目
   static List<HfModel> parseFallbackJson(String raw) {
+    Map<String, dynamic> data;
     try {
-      final data = jsonDecode(raw) as Map<String, dynamic>;
-      return (data['models'] as List)
-          .map((e) => HfModel.fromJson(e as Map<String, dynamic>))
-          .toList();
-    } catch (_) {
+      data = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (e) {
+      debugPrint('ModelService: 兜底清单 JSON 解析失败: $e');
       return const [];
     }
+    final models = data['models'];
+    if (models is! List) {
+      debugPrint('ModelService: 兜底清单缺少 models 数组，实际类型 ${models.runtimeType}');
+      return const [];
+    }
+    final result = <HfModel>[];
+    for (var i = 0; i < models.length; i++) {
+      try {
+        result.add(HfModel.fromJson(models[i] as Map<String, dynamic>));
+      } catch (e) {
+        debugPrint('ModelService: 兜底清单第 $i 条解析失败，已跳过: $e');
+      }
+    }
+    return result;
   }
 
   /// 网络异常时加载内置精选清单
   Future<List<HfModel>> loadFallbackModels() async {
     try {
       return parseFallbackJson(await rootBundle.loadString(_fallbackAssetPath));
-    } catch (_) {
+    } catch (e) {
+      debugPrint('ModelService: 兜底清单资产加载失败($_fallbackAssetPath): $e');
       return const [];
     }
   }
