@@ -236,17 +236,25 @@ class DownloadManager {
   }
 
   /// 取消并删除 .part
-  Future<void> cancel(String id) async {
+  Future<void> cancel(String id) => _remove(id, reason: '用户取消');
+
+  /// 清除指定路径的任务记录（本地模型文件被删除后联动调用）：
+  /// 移除任务、取消运行中 token、删 .part、持久化，
+  /// 避免残留的 completed 记录指向已删除文件导致详情页死锁
+  Future<void> forget(String savePath) =>
+      _remove(savePath, reason: '模型已删除');
+
+  Future<void> _remove(String id, {required String reason}) async {
     final task = _tasks[id];
     if (task == null) return;
-    task._cancelToken?.cancel('用户取消');
+    task._cancelToken?.cancel(reason);
     _tasks.remove(id);
     _queue.remove(task);
     try {
       final part = File(task.partPath);
       if (await part.exists()) await part.delete();
     } catch (e) {
-      // 删除失败不阻断取消流程
+      // 删除失败不阻断流程
       debugPrint('[DownloadManager] 删除 .part 失败: $e');
     }
     _persist();

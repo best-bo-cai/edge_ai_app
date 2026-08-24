@@ -550,4 +550,100 @@ void main() {
       expect(await File('${tmpDir.path}/g.gguf').readAsBytes(), bytesG);
     }
   });
+
+  test('forget：移除 paused 任务记录并删除 .part（模型删除联动）', () async {
+    final bytes = List<int>.generate(1000, (i) => i % 7);
+    final savePath = '${tmpDir.path}/model.gguf';
+    const url = 'https://example.com/model.gguf';
+    final server = FakeRangeServer(bytes, hangAfterBytes: 400);
+    final dm = DownloadManager(dio: Dio()..httpClientAdapter = server);
+
+    final task = await dm.start(
+        url: url, displayName: 'model', savePath: savePath);
+    await waitUntil(() => task.receivedBytes >= 400);
+    await dm.pause(savePath);
+    await waitUntil(() => task.status == DownloadStatus.paused);
+    expect(await File('$savePath.part').exists(), true);
+
+    await dm.forget(savePath);
+
+    expect(dm.taskOf(savePath), isNull);
+    expect(await File('$savePath.part').exists(), false); // .part 已清理
+  });
+
+  test('forget：清除 completed 任务记录（防详情页指向已删文件死锁）', () async {
+    final bytes = List<int>.generate(300, (i) => i % 13);
+    final savePath = '${tmpDir.path}/model.gguf';
+    const url = 'https://example.com/model.gguf';
+    final dm = DownloadManager(dio: Dio()..httpClientAdapter = FakeRangeServer(bytes));
+
+    final done = dm.events.firstWhere(
+        (t) => t.id == savePath && t.status == DownloadStatus.completed);
+    await dm.start(url: url, displayName: 'model', savePath: savePath);
+    await done.timeout(const Duration(seconds: 10));
+    expect(dm.taskOf(savePath)!.status, DownloadStatus.completed);
+
+    // 模拟模型管理页删除文件后的联动清理
+    await File(savePath).delete();
+    await dm.forget(savePath);
+
+    expect(dm.taskOf(savePath), isNull);
+  });
+
+  test('I1: completed 记录但文件已删 → start 清空完成态重新下载', () async {
+    final bytes = List<int>.generate(500, (i) => i % 256);
+    final savePath = '${tmpDir.path}/model.gguf';
+    const url = 'https://example.com/model.gguf';
+    final server = FakeRangeServer(bytes);
+    final dm = DownloadManager(dio: Dio()..httpClientAdapter = server);
+
+    final done1 = dm.events.firstWhere(
+        (t) => t.id == savePath && t.status == DownloadStatus.completed);
+    final task = await dm.start(
+        url: url, displayName: 'model', savePath: savePath);
+    await done1.timeout(const Duration(seconds: 10));
+
+    // 外部删除文件（记录未清理的极端场景）
+    await File(savePath).delete();
+
+    // 再次 start：不因 completed 记录短路，重新完整下载
+    final done2 = dm.events.firstWhere(
+        (t) => t.id == savePath && t.status == DownloadStatus.completed);
+    await dm.start(url: url, displayName: 'model', savePath: savePath);
+    await done2.timeout(const Duration(seconds: 10));
+
+    expect(server.ranges, ['none', 'none']); // 两次全新下载
+    expect(await File(savePath).readAsBytes(), bytes);
+    expect(task.receivedBytes, 500); // 完成态进度已重置并重新累计
+  });
+
+  test('Minor5: 取消排队任务——出队且不会被队列唤醒', () async {
+    const urlA = 'https://example.com/a.gguf';
+    const urlB = 'https://example.com/b.gguf';
+    final bytesA = List<int>.generate(1000, (i) => i % 7);
+    final bytesB = List<int>.generate(200, (i) => i % 11);
+    final server = FakeRangeServer([], files: {
+      urlA: bytesA,
+      urlB: bytesB,
+    }, hangAfterBytes: 400);
+    final dm = DownloadManager(dio: Dio()..httpClientAdapter = server);
+
+    final tA = await dm.start(
+        url: urlA, displayName: 'a', savePath: '${tmpDir.path}/a.gguf');
+    final tB = await dm.start(
+        url: urlB, displayName: 'b', savePath: '${tmpDir.path}/b.gguf');
+    expect(tB.status, DownloadStatus.queued);
+
+    await dm.cancel(tB.id);
+    expect(dm.taskOf(tB.id), isNull);
+
+    // 前序暂停释放队列后，已取消的 B 不得被唤醒
+    await waitUntil(() => tA.receivedBytes >= 400);
+    await dm.pause(tA.id);
+    await waitUntil(() => tA.status == DownloadStatus.paused);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+
+    expect(server.requested, [urlA]); // B 从未发起请求
+    expect(dm.taskOf(tB.id), isNull);
+  });
 }

@@ -1,7 +1,6 @@
 // lib/features/model_market/model_detail_screen.dart
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
-import 'package:path_provider/path_provider.dart';
 
 import '../../core/device/device_capability_service.dart';
 import '../../core/models/compatibility.dart';
@@ -29,7 +28,6 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
   List<HfModelFile>? _files;
   bool _loading = true;
   String? _error;
-  late String _modelsDirPath;
 
   @override
   void initState() {
@@ -39,8 +37,6 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
 
   Future<void> _init() async {
     _capability = await DeviceCapabilityService().getCapability();
-    final appDir = await getApplicationDocumentsDirectory();
-    _modelsDirPath = '${appDir.path}/models';
     try {
       _files = await _api.getModelFiles(widget.model.id);
     } catch (_) {
@@ -53,6 +49,11 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
       });
     }
   }
+
+  /// 下载保存路径：models/{author}/{fileName}（I4 跨仓库同名隔离，
+  /// repoId 斜杠分割的首段作子目录，避免不同仓库的同名 GGUF 互相覆盖）
+  String _savePathFor(HfModelFile file) =>
+      '${_modelService.modelsDirPath}/${file.repoId.split('/').first}/${file.fileName}';
 
   /// 下载前拦截校验：存储空间（需求 2.4：≥ 文件+2GB）+ 蜂窝网络提醒
   Future<void> _onDownloadFile(HfModelFile file) async {
@@ -105,7 +106,7 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
       await DownloadManager.instance.start(
         url: _api.downloadUrl(file.repoId, file.fileName),
         displayName: file.fileName,
-        savePath: '$_modelsDirPath/${file.fileName}',
+        savePath: _savePathFor(file),
         totalBytes: file.sizeBytes,
         expectedSha256: file.sha256,
       );
@@ -249,8 +250,7 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
               children: [
                 Expanded(
                   child: DownloadButton(
-                    file: file,
-                    modelsDirPath: _modelsDirPath,
+                    savePath: _savePathFor(file),
                     onStart: () => _onDownloadFile(file),
                     onRun: _onRunModel,
                   ),

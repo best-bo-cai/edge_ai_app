@@ -8,6 +8,7 @@ import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:edge_ai_app/core/models/hf_catalog_models.dart';
+import 'package:edge_ai_app/core/services/download_manager.dart';
 
 /// 模型信息数据类
 class ModelInfo {
@@ -159,11 +160,13 @@ class ModelService {
     return modelsDir;
   }
 
-  /// 扫描本地已下载的模型
+  /// 扫描本地已下载的模型。
+  /// I4: 递归扫描子目录（models/{author}/{fileName}），
+  /// 兼容平铺在 models 根目录的旧文件
   Future<void> _scanLocalModels() async {
     _availableModels.clear();
-    
-    final entries = _modelsDir.listSync();
+
+    final entries = _modelsDir.listSync(recursive: true);
     for (final entry in entries) {
       if (entry is File && entry.path.endsWith('.gguf')) {
         final stat = await entry.stat();
@@ -277,7 +280,11 @@ class ModelService {
     final file = File(model.path);
     if (await file.exists()) {
       await file.delete();
-      
+
+      // I1: 联动清除下载任务记录，避免详情页 completed 态
+      // 指向已删除的文件（渲染死锁）
+      await DownloadManager.instance.forget(model.path);
+
       // 如果删除的是当前模型，清空当前选择
       if (_currentModelId == modelId) {
         _currentModelId = null;
