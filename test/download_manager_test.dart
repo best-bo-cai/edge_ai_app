@@ -111,13 +111,15 @@ class FakeRangeServer implements HttpClientAdapter {
   void close({bool force = false}) {}
 }
 
-/// 轮询等待条件成立（带超时保护）
+/// 轮询等待条件成立（带超时保护；超时视为失败而非静默通过）
 Future<void> waitUntil(bool Function() condition,
     {Duration timeout = const Duration(seconds: 5)}) async {
   final deadline = DateTime.now().add(timeout);
   while (!condition() && DateTime.now().isBefore(deadline)) {
     await Future<void>.delayed(const Duration(milliseconds: 10));
   }
+  expect(condition(), true,
+      reason: 'waitUntil 超时（${timeout.inMilliseconds}ms）条件仍未成立');
 }
 
 void main() {
@@ -157,19 +159,24 @@ void main() {
   test('断点续传：已有 .part 时发送 Range 并追加写', () async {
     final bytes = List<int>.generate(1000, (i) => i % 256);
     final savePath = '${tmpDir.path}/model.gguf';
-    await File('$savePath.part').writeAsBytes(bytes.sublist(0, 400));
-    final server = FakeRangeServer(bytes);
+    const url = 'https://example.com/model.gguf';
+    final server = FakeRangeServer(bytes, hangAfterBytes: 400);
     final dm = DownloadManager(dio: Dio()..httpClientAdapter = server);
 
+    // 先下载 400 字节后暂停，产生归属明确（有任务记录）的 .part
+    final task = await dm.start(
+        url: url, displayName: 'model', savePath: savePath);
+    await waitUntil(() => task.receivedBytes >= 400);
+    await dm.pause(savePath);
+    await waitUntil(() => task.status == DownloadStatus.paused);
+
+    // 再次 start 同一任务：从 400 字节续传直到完成
     final done = dm.events.firstWhere(
         (t) => t.id == savePath && t.status == DownloadStatus.completed);
-    await dm.start(
-        url: 'https://example.com/model.gguf',
-        displayName: 'model',
-        savePath: savePath);
-    final task = await done.timeout(const Duration(seconds: 10));
+    await dm.start(url: url, displayName: 'model', savePath: savePath);
+    await done.timeout(const Duration(seconds: 10));
 
-    expect(server.ranges.single, 'bytes=400-');
+    expect(server.ranges, ['none', 'bytes=400-']);
     expect(await File(savePath).readAsBytes(), bytes);
     expect(task.totalBytes, 1000);
   });
@@ -387,5 +394,160 @@ void main() {
     expect(await File('${tmpDir.path}/a.gguf').readAsBytes(), bytesA);
     expect(await File('${tmpDir.path}/b.gguf').readAsBytes(), bytesB);
     expect(tB.status, DownloadStatus.completed);
+  });
+
+  test('P1 防重入：并发 start+resume 仅启动一个 _runLoop（请求数=1）', () async {
+    final bytes = List<int>.generate(1000, (i) => i % 7);
+    final savePath = '${tmpDir.path}/model.gguf';
+    const url = 'https://example.com/model.gguf';
+    // 经 init 恢复 paused 任务（.part 400 字节），此后尚无任何请求
+    await File('$savePath.part').writeAsBytes(bytes.sublist(0, 400), flush: true);
+    SharedPreferences.setMockInitialValues({
+      'download_tasks': jsonEncode([
+        {
+          'id': savePath,
+          'url': url,
+          'displayName': 'model',
+          'savePath': savePath,
+          'totalBytes': 1000,
+          'expectedSha256': null,
+          'receivedBytes': 400,
+          'status': 'paused',
+        },
+      ]),
+    });
+    final server = FakeRangeServer(bytes);
+    final dm = DownloadManager(dio: Dio()..httpClientAdapter = server);
+    await dm.init();
+
+    // start() 挂起在 await exists() 时 resume() 抢跑置 downloading 并启动
+    // _runLoop；start 恢复后不再复查状态、直接 unawaited(_run(task))，
+    // 若无 _isRunning 防重入标志将双开 _runLoop 双写 .part
+    final startFuture =
+        dm.start(url: url, displayName: 'model', savePath: savePath);
+    await dm.resume(savePath);
+    await startFuture;
+
+    final done = dm.events.firstWhere(
+        (t) => t.id == savePath && t.status == DownloadStatus.completed);
+    await done.timeout(const Duration(seconds: 10));
+
+    expect(server.requested.length, 1); // 双开则会发出第二个请求
+    expect(server.ranges.single, 'bytes=400-');
+    expect(await File(savePath).readAsBytes(), bytes);
+  });
+
+  test('P2: 孤儿 .part 不被新任务复用（防跨源续传损坏）', () async {
+    final bytes = List<int>.generate(1000, (i) => i % 256);
+    final savePath = '${tmpDir.path}/model.gguf';
+    // 无任务记录：磁盘残留来源不明的 .part
+    await File('$savePath.part').writeAsBytes(List<int>.filled(400, 9));
+    final server = FakeRangeServer(bytes);
+    final dm = DownloadManager(dio: Dio()..httpClientAdapter = server);
+
+    final done = dm.events.firstWhere(
+        (t) => t.id == savePath && t.status == DownloadStatus.completed);
+    await dm.start(
+        url: 'https://example.com/model.gguf',
+        displayName: 'model',
+        savePath: savePath);
+    await done.timeout(const Duration(seconds: 10));
+
+    expect(server.ranges.single, 'none'); // 未携带 Range（未复用残留 .part）
+    expect(await File(savePath).readAsBytes(), bytes); // 无残留字节混入
+  });
+
+  test('rename 前取消：任务不复活、不产生最终文件', () async {
+    // 2MB 数据拉长 SHA256 校验窗口，确保取消发生在校验期间（rename 之前）
+    final bytes = List<int>.generate(2 * 1024 * 1024, (i) => i % 251);
+    final savePath = '${tmpDir.path}/model.gguf';
+    final dm = DownloadManager(
+        dio: Dio()..httpClientAdapter = FakeRangeServer(bytes));
+
+    final verifying = dm.events.firstWhere(
+        (t) => t.id == savePath && t.status == DownloadStatus.verifying);
+    await dm.start(
+      url: 'https://example.com/model.gguf',
+      displayName: 'model',
+      savePath: savePath,
+      expectedSha256: sha256.convert(bytes).toString(),
+    );
+    await verifying.timeout(const Duration(seconds: 10));
+
+    // 校验期间取消：任务被移除、.part 被删，校验完成后不得 rename 复活
+    await dm.cancel(savePath);
+    await waitUntil(() => dm.taskOf(savePath) == null);
+    await Future<void>.delayed(const Duration(milliseconds: 300));
+
+    expect(dm.taskOf(savePath), isNull);
+    expect(await File(savePath).exists(), false); // 未 rename 出最终文件
+    expect(await File('$savePath.part').exists(), false);
+  });
+
+  test('failed/paused 后队列自动继续下载下一个任务', () async {
+    // —— 场景 1：前序 paused 释放串行队列 ——
+    {
+      const urlP = 'https://example.com/p.gguf';
+      const urlQ = 'https://example.com/q.gguf';
+      final bytesP = List<int>.generate(1000, (i) => i % 7);
+      final bytesQ = List<int>.generate(200, (i) => i % 11);
+      final server = FakeRangeServer([], files: {
+        urlP: bytesP,
+        urlQ: bytesQ,
+      }, hangAfterBytes: 400);
+      final dm = DownloadManager(dio: Dio()..httpClientAdapter = server);
+
+      final tP = await dm.start(
+          url: urlP, displayName: 'p', savePath: '${tmpDir.path}/p.gguf');
+      // 订阅须早于 Q 启动：broadcast 流中已发出的事件无法补收
+      final doneQ = dm.events.firstWhere((t) =>
+          t.id == '${tmpDir.path}/q.gguf' &&
+          t.status == DownloadStatus.completed);
+      final tQ = await dm.start(
+          url: urlQ, displayName: 'q', savePath: '${tmpDir.path}/q.gguf');
+      expect(tQ.status, DownloadStatus.queued);
+
+      await waitUntil(() => tP.receivedBytes >= 400);
+      await dm.pause(tP.id);
+      await waitUntil(() => tP.status == DownloadStatus.paused);
+
+      await doneQ.timeout(const Duration(seconds: 10));
+
+      expect(tQ.status, DownloadStatus.completed);
+      expect(await File('${tmpDir.path}/q.gguf').readAsBytes(), bytesQ);
+    }
+
+    // —— 场景 2：前序 failed（SHA256 校验失败，无重试延迟）释放串行队列 ——
+    {
+      const urlF = 'https://example.com/f.gguf';
+      const urlG = 'https://example.com/g.gguf';
+      final bytesF = List<int>.generate(300, (i) => i % 13);
+      final bytesG = List<int>.generate(200, (i) => i % 17);
+      final server = FakeRangeServer([], files: {
+        urlF: bytesF,
+        urlG: bytesG,
+      });
+      final dm = DownloadManager(dio: Dio()..httpClientAdapter = server);
+
+      // 订阅须早于 G 启动：broadcast 流中已发出的事件无法补收
+      final doneG = dm.events.firstWhere((t) =>
+          t.id == '${tmpDir.path}/g.gguf' &&
+          t.status == DownloadStatus.completed);
+      final tF = await dm.start(
+          url: urlF,
+          displayName: 'f',
+          savePath: '${tmpDir.path}/f.gguf',
+          expectedSha256: 'deadbeef'); // 必然校验失败
+      final tG = await dm.start(
+          url: urlG, displayName: 'g', savePath: '${tmpDir.path}/g.gguf');
+      expect(tG.status, DownloadStatus.queued);
+
+      await waitUntil(() => tF.status == DownloadStatus.failed);
+      await doneG.timeout(const Duration(seconds: 10));
+
+      expect(tG.status, DownloadStatus.completed); // failed 后队列自动继续
+      expect(await File('${tmpDir.path}/f.gguf').exists(), false);
+      expect(await File('${tmpDir.path}/g.gguf').readAsBytes(), bytesG);
+    }
   });
 }

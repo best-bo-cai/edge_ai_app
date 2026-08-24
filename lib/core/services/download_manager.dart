@@ -28,6 +28,11 @@ class DownloadTask {
   int _retryCount = 0;
   CancelToken? _cancelToken;
 
+  /// P1: _runLoop 防重入标志——start() 的状态检查与 resume() 的状态翻转
+  /// 之间存在异步间隙（TOCTOU），并发调用会双开 _runLoop 双写 .part，
+  /// 须以此标志保证同一任务同一时刻仅一个 _runLoop 在运行
+  bool _isRunning = false;
+
   DownloadTask({
     required this.id,
     required this.url,
@@ -161,6 +166,12 @@ class DownloadManager {
 
     final DownloadTask task;
     if (existing != null) {
+      // P4: 走到这里且状态为 completed，说明最终文件已丢失需重新下载，
+      // 清空完成态数据，避免 _runLoop 启动前 UI 短暂显示旧完成进度/时间
+      if (existing.status == DownloadStatus.completed) {
+        existing.completedAt = null;
+        existing.receivedBytes = 0;
+      }
       // 已存在的非运行任务更新下载参数
       if (existing.url != url) {
         // 旧 .part 属于旧 url，不能续传复用
@@ -175,6 +186,12 @@ class DownloadManager {
       if (totalBytes > 0) existing.totalBytes = totalBytes;
       task = existing;
     } else {
+      // P2: 新建任务时磁盘上已有的 .part 无法证明归属（可能是其他 url 的
+      // 残留或损坏数据），一律删除，防止跨源续传拼出损坏文件
+      try {
+        final orphan = File('$savePath.part');
+        if (await orphan.exists()) await orphan.delete();
+      } catch (_) {}
       task = DownloadTask(
         id: savePath,
         url: url,
@@ -244,10 +261,16 @@ class DownloadManager {
       if (!_queue.contains(task)) _queue.add(task);
       return;
     }
+    // P1: 防重入——同步段原子检查置位。并发 start()+resume() 时后到者在
+    // 此处直接返回（不进 try/finally，避免误清理 _active），彻底封死双开
+    if (task._isRunning) return;
+    task._isRunning = true;
     _active = task;
     try {
       await _runLoop(task);
     } finally {
+      // P1: 复位须在 _startNextQueued 之前，杜绝唤醒队列时同任务再开
+      task._isRunning = false;
       if (_active == task) {
         _active = null;
         _startNextQueued();
