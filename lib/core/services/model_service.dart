@@ -1,8 +1,12 @@
+import 'dart:convert';
 import 'dart:io';
 import 'package:dio/dio.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'package:edge_ai_app/core/models/hf_catalog_models.dart';
 
 /// 模型信息数据类
 class ModelInfo {
@@ -93,6 +97,29 @@ class ModelService {
       'description': '轻量级，适合低端设备或快速测试',
     },
   ];
+
+  static const String _fallbackAssetPath = 'assets/data/fallback_models.json';
+
+  /// 解析兜底清单 JSON（需求 3.1）
+  static List<HfModel> parseFallbackJson(String raw) {
+    try {
+      final data = jsonDecode(raw) as Map<String, dynamic>;
+      return (data['models'] as List)
+          .map((e) => HfModel.fromJson(e as Map<String, dynamic>))
+          .toList();
+    } catch (_) {
+      return const [];
+    }
+  }
+
+  /// 网络异常时加载内置精选清单
+  Future<List<HfModel>> loadFallbackModels() async {
+    try {
+      return parseFallbackJson(await rootBundle.loadString(_fallbackAssetPath));
+    } catch (_) {
+      return const [];
+    }
+  }
 
   /// 初始化服务
   Future<void> init() async {
