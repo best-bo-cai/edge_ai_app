@@ -301,9 +301,22 @@ class ModelService {
     }
 
     _currentModelId = modelId;
-    
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('current_model_id', modelId);
+  }
+
+  /// 模型存储目录（main 中 init 后可用）
+  String get modelsDirPath => _modelsDir.path;
+
+  /// 按文件路径加载运行（详情页"加载运行"入口）
+  Future<void> switchModelByPath(String path) async {
+    await _scanLocalModels();
+    final model = _availableModels.firstWhere(
+      (m) => m.path == path,
+      orElse: () => throw Exception('模型不存在'),
+    );
+    await switchModel(model.id);
   }
 
   /// 检查模型是否已下载
