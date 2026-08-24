@@ -4,6 +4,7 @@ import 'dart:typed_data';
 
 import 'package:dio/dio.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:edge_ai_app/core/services/hf_api_service.dart';
 
 /// 记录请求并可注入响应/异常的 Dio 适配器
@@ -33,6 +34,10 @@ class MockAdapter implements HttpClientAdapter {
 
 void main() {
   TestWidgetsFlutterBinding.ensureInitialized();
+
+  setUp(() {
+    SharedPreferences.setMockInitialValues({});
+  });
 
   test('searchModels 拼装需求参数并解析模型', () async {
     final dio = Dio()..httpClientAdapter = MockAdapter((options) async {
@@ -111,6 +116,125 @@ void main() {
     expect(
       api.downloadUrl('Qwen/Qwen2.5-0.5B-Instruct-GGUF', 'a.gguf'),
       'https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/a.gguf',
+    );
+  });
+
+  test('切换镜像后落盘 hf_active_host，新实例 restoreHost 恢复镜像', () async {
+    final dio = Dio()..httpClientAdapter = MockAdapter((options) async {
+      if (options.uri.host == 'huggingface.co') {
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.connectionTimeout,
+        );
+      }
+      return <Map<String, dynamic>>[
+        {'id': 'a/b-GGUF', 'downloads': 1, 'likes': 1, 'tags': []},
+      ];
+    });
+    final api = HfApiService(dio: dio);
+    await api.searchModels();
+
+    // 验证落盘
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('hf_active_host'), HfApiService.mirrorHost);
+
+    // 模拟重启：新实例从磁盘恢复
+    final api2 = HfApiService(dio: dio);
+    await api2.restoreHost();
+    expect(api2.activeHost, HfApiService.mirrorHost);
+  });
+
+  test('restoreHost 白名单校验：脏数据回退官方源', () async {
+    SharedPreferences.setMockInitialValues({
+      'hf_active_host': 'https://evil.example.com',
+    });
+    final api = HfApiService(dio: Dio());
+    await api.restoreHost();
+    expect(api.activeHost, HfApiService.officialHost);
+  });
+
+  test('badResponse（如仓库不存在）不切源，仅请求一次并透传状态码', () async {
+    final dio = Dio()..httpClientAdapter = MockAdapter((options) async {
+      throw DioException(
+        requestOptions: options,
+        type: DioExceptionType.badResponse,
+        response: Response(requestOptions: options, statusCode: 404),
+      );
+    });
+    final api = HfApiService(dio: dio);
+    final future = api.getModelFiles('a/not-exist');
+    await expectLater(
+      future,
+      throwsA(isA<HfApiException>().having(
+        (e) => e.message,
+        'message',
+        contains('404'),
+      )),
+    );
+    expect((dio.httpClientAdapter as MockAdapter).requests.length, 1);
+    expect(api.activeHost, HfApiService.officialHost);
+  });
+
+  test('镜像连接失败反向回退官方源', () async {
+    SharedPreferences.setMockInitialValues({
+      'hf_active_host': HfApiService.mirrorHost,
+    });
+    final dio = Dio()..httpClientAdapter = MockAdapter((options) async {
+      if (options.uri.host == 'hf-mirror.com') {
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.connectionTimeout,
+        );
+      }
+      return <Map<String, dynamic>>[
+        {'id': 'a/b-GGUF', 'downloads': 1, 'likes': 1, 'tags': []},
+      ];
+    });
+    final api = HfApiService(dio: dio);
+    await api.restoreHost();
+    await api.searchModels();
+
+    expect(api.activeHost, HfApiService.officialHost);
+    final hosts = (dio.httpClientAdapter as MockAdapter)
+        .requests
+        .map((r) => r.uri.host)
+        .toList();
+    expect(hosts, ['hf-mirror.com', 'huggingface.co']);
+  });
+
+  test('200 但非 JSON 数组时包装为 HfApiException（不裸抛 TypeError）', () async {
+    final dio = Dio()..httpClientAdapter = MockAdapter((options) async {
+      return {'error': 'not a list'};
+    });
+    final api = HfApiService(dio: dio);
+    await expectLater(
+      api.searchModels(),
+      throwsA(isA<HfApiException>()),
+    );
+  });
+
+  test('备用源 badResponse 透传业务语义，不误报"双源均不可用"', () async {
+    final dio = Dio()..httpClientAdapter = MockAdapter((options) async {
+      if (options.uri.host == 'huggingface.co') {
+        throw DioException(
+          requestOptions: options,
+          type: DioExceptionType.connectionTimeout,
+        );
+      }
+      throw DioException(
+        requestOptions: options,
+        type: DioExceptionType.badResponse,
+        response: Response(requestOptions: options, statusCode: 404),
+      );
+    });
+    final api = HfApiService(dio: dio);
+    await expectLater(
+      api.getModelFiles('a/b'),
+      throwsA(isA<HfApiException>().having(
+        (e) => e.message,
+        'message',
+        allOf(contains('404'), isNot(contains('均不可用'))),
+      )),
     );
   });
 }

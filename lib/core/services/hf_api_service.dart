@@ -1,5 +1,6 @@
 // lib/core/services/hf_api_service.dart
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/hf_catalog_models.dart';
@@ -21,6 +22,11 @@ class HfApiService {
   final Dio _dio;
   String activeHost = officialHost;
 
+  /// 最近一次成功落盘的数据源；null 表示未知（下次成功请求会补写一次盘）
+  String? _persistedHost;
+
+  /// [dio] 可注入用于测试或定制拦截器；注意注入时不会应用下方默认超时，
+  /// 调用方需自行配置 connectTimeout/receiveTimeout，避免请求无限挂起。
   HfApiService({Dio? dio})
       : _dio = dio ??
             Dio(BaseOptions(
@@ -28,12 +34,23 @@ class HfApiService {
               receiveTimeout: const Duration(seconds: 15),
             ));
 
-  /// 启动时恢复上次可用数据源（首屏提速）
+  /// 启动时恢复上次可用数据源（首屏提速）；仅接受白名单内的主机，脏数据回退官方源
   Future<void> restoreHost() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      activeHost = prefs.getString(_hostPrefKey) ?? officialHost;
-    } catch (_) {}
+      final saved = prefs.getString(_hostPrefKey);
+      if (saved == mirrorHost) {
+        activeHost = mirrorHost;
+      } else {
+        if (saved != null && saved != officialHost) {
+          debugPrint('HfApiService: 忽略未知数据源 "$saved"，回退官方源');
+        }
+        activeHost = officialHost;
+      }
+      _persistedHost = activeHost;
+    } catch (e) {
+      debugPrint('HfApiService: 恢复数据源失败: $e');
+    }
   }
 
   /// 推荐模型列表：GET /api/models（filter=gguf, sort=downloads, direction=-1）
@@ -80,31 +97,51 @@ class HfApiService {
   Future<dynamic> _withHostFallback(Future<dynamic> Function(String host) run) async {
     try {
       final result = await run(activeHost);
-      _rememberHost(activeHost);
+      await _rememberHost(activeHost);
       return result;
     } on DioException catch (e) {
-      final isConnError = e.type == DioExceptionType.connectionTimeout ||
-          e.type == DioExceptionType.connectionError ||
-          e.type == DioExceptionType.receiveTimeout;
-      if (!isConnError) {
-        throw HfApiException('请求失败: ${e.message}');
+      if (!_isConnError(e)) {
+        throw HfApiException(_failureMessage(e));
       }
       final alt = activeHost == officialHost ? mirrorHost : officialHost;
       try {
         final result = await run(alt);
         activeHost = alt;
-        _rememberHost(alt);
+        await _rememberHost(alt);
         return result;
+      } on DioException catch (e2) {
+        // 备用源 badResponse 携带业务语义（如 404"仓库不存在"），透传而非误报"双源均不可用"
+        throw HfApiException(
+          _isConnError(e2) ? '官方源与镜像均不可用: $e2' : _failureMessage(e2),
+        );
       } catch (e2) {
-        throw HfApiException('官方源与镜像均不可用: $e2');
+        throw HfApiException('响应解析失败: $e2');
       }
+    } catch (e) {
+      // 兜底：非 DioException（如 200 但非 JSON 时 as 转换抛出的 TypeError）
+      throw HfApiException('响应解析失败: $e');
     }
   }
 
+  bool _isConnError(DioException e) =>
+      e.type == DioExceptionType.connectionTimeout ||
+      e.type == DioExceptionType.connectionError ||
+      e.type == DioExceptionType.receiveTimeout;
+
+  String _failureMessage(DioException e) {
+    final status = e.response?.statusCode;
+    return status != null ? '请求失败(HTTP $status)' : '请求失败: ${e.message}';
+  }
+
+  /// 仅在数据源切换/变化时写盘并 await，成功后同步内存缓存
   Future<void> _rememberHost(String host) async {
+    if (_persistedHost == host) return; // 未变化，免写盘
     try {
       final prefs = await SharedPreferences.getInstance();
       await prefs.setString(_hostPrefKey, host);
-    } catch (_) {}
+      _persistedHost = host;
+    } catch (e) {
+      debugPrint('HfApiService: 持久化数据源失败: $e');
+    }
   }
 }
