@@ -68,6 +68,11 @@ void main() {
       expect(CompatibilityEngine.evaluateModel(cap(8), const HfModel(id: 'a/some-model-gguf')),
           CompatibilityLevel.unknown);
     });
+    // runnable 上边界：params 恰为 tier×1.5 = 1.5×1.5 = 2.25B 时仍可运行
+    test('4GB 设备：2.25B 恰达 runnable 上边界 → 可运行', () {
+      expect(CompatibilityEngine.evaluateModel(cap(4), const HfModel(id: 'a/model-2.25B-GGUF')),
+          CompatibilityLevel.runnable);
+    });
     test('RAM 未知按 4GB 保守分档', () {
       const unknown = DeviceCapability(totalRamBytes: null, cpuCores: 8, abi: 'x');
       expect(CompatibilityEngine.evaluateModel(unknown, const HfModel(id: 'a/Qwen2.5-7B-GGUF')),
@@ -87,6 +92,13 @@ void main() {
     test('4GB 设备 + 4GB 文件 → 超出', () {
       final f = HfModelFile(repoId: 'a/b', path: 'x-q4_k_m.gguf', sizeBytes: 4 * gb);
       expect(CompatibilityEngine.evaluateFile(cap(4), f), CompatibilityLevel.overkill);
+    });
+    // 脏数据防御：size 缺失（fromJson 默认 0）或为负时不做判断
+    test('sizeBytes 非法（0/负数）→ unknown', () {
+      final zero = HfModelFile(repoId: 'a/b', path: 'x.gguf', sizeBytes: 0);
+      expect(CompatibilityEngine.evaluateFile(cap(8), zero), CompatibilityLevel.unknown);
+      final neg = HfModelFile(repoId: 'a/b', path: 'x.gguf', sizeBytes: -1024);
+      expect(CompatibilityEngine.evaluateFile(cap(8), neg), CompatibilityLevel.unknown);
     });
   });
 
