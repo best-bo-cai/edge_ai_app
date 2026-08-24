@@ -258,7 +258,7 @@ class _ModelMarketScreenState extends State<ModelMarketScreen> {
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                '本机配置：${cap.isEstimated ? '≈' : ''}$gb GB 内存 · ${cap.cpuCores} 核 · ${cap.abi}'
+                '本机配置：${cap.isEstimated ? '≈' : ''}$gb GB 物理内存 · ${cap.cpuCores} 核 · ${cap.abi}'
                 '${cap.freeDiskBytes != null ? ' · 可用存储 ${_fmtBytes(cap.freeDiskBytes!)}' : ''}',
                 style: const TextStyle(fontSize: 12, color: Colors.black54),
               ),
