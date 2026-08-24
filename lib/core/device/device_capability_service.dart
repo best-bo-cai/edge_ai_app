@@ -1,7 +1,6 @@
 import 'dart:io';
 
 import 'package:device_info_plus/device_info_plus.dart';
-import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -20,7 +19,7 @@ class DeviceCapabilityService {
         abi = info.supportedAbis.isNotEmpty ? info.supportedAbis.first : 'unknown';
       } else if (Platform.isIOS) {
         abi = 'arm64';
-      } else if (!kIsWeb) {
+      } else {
         abi = Platform.operatingSystem;
       }
     } catch (_) {}
@@ -28,8 +27,12 @@ class DeviceCapabilityService {
     int? totalRam;
     int? freeDisk;
     try {
-      final dir = await getApplicationDocumentsDirectory();
       totalRam = await _channel.invokeMethod<int>('getTotalRam');
+    } catch (_) {
+      // 平台通道未实现（桌面/单测）→ 保持 null，走保守降级
+    }
+    try {
+      final dir = await getApplicationDocumentsDirectory();
       freeDisk = await _channel.invokeMethod<int>('getFreeDisk', {'path': dir.path});
     } catch (_) {
       // 平台通道未实现（桌面/单测）→ 保持 null，走保守降级

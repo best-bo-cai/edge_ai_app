@@ -14,15 +14,23 @@ class MainActivity : FlutterActivity() {
             .setMethodCallHandler { call, result ->
                 when (call.method) {
                     "getTotalRam" -> {
-                        val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
-                        val mi = ActivityManager.MemoryInfo()
-                        am.getMemoryInfo(mi)
-                        result.success(mi.totalMem)
+                        try {
+                            val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+                            val mi = ActivityManager.MemoryInfo()
+                            am.getMemoryInfo(mi)
+                            result.success(mi.totalMem)
+                        } catch (e: Exception) {
+                            result.error("DEVICE_INFO_ERROR", e.message, null)
+                        }
                     }
                     "getFreeDisk" -> {
-                        val path = call.argument<String>("path") ?: filesDir.absolutePath
-                        val stat = StatFs(path)
-                        result.success(stat.availableBytes)
+                        try {
+                            val path = call.argument<String>("path") ?: filesDir.absolutePath
+                            val stat = StatFs(path)
+                            result.success(stat.availableBytes)
+                        } catch (e: Exception) {
+                            result.error("DEVICE_INFO_ERROR", e.message, null)
+                        }
                     }
                     else -> result.notImplemented()
                 }
