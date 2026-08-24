@@ -9,8 +9,13 @@ class QuantLevel {
 
 /// GGUF 文件名量化解析器
 class QuantParser {
+  /// 收紧规则（代码审查修复）：
+  /// - 左/右边界断言：量化标识须为独立 token，"GPTQ4"→null、"tq1_0"→TQ1_0（而非 Q1_0）
+  /// - 位宽约束：Q 限 2-8、IQ 限 1-4、TQ 限 1-2，"Q40"/"IQ9" 等多位/越界位宽不匹配
+  /// - TQ1_0/TQ2_0 与 MXFP4 新格式分支
+  /// - 后缀段数上限：最多 2 段（如 Q4_K_M），每段 1-3 个字母数字
   static final RegExp _pattern = RegExp(
-    r'(IQ\d+(?:_[A-Z0-9]{1,3}){0,2}|Q\d+(?:_[A-Z0-9]{1,3}){0,2}|BF16|F16|F32)',
+    r'(?<![A-Za-z0-9])(?:(?:IQ[1-4]|Q[2-8])(?:_[A-Z0-9]{1,3}){0,2}|TQ[12]_0|MXFP4|BF16|F16|F32)(?![A-Za-z0-9])',
     caseSensitive: false,
   );
 
@@ -23,6 +28,7 @@ class QuantParser {
 
   static String qualityOf(String label) {
     if (label == 'F32' || label == 'F16' || label == 'BF16') return '未量化（体积大）';
+    if (label.startsWith('MXFP4')) return '平衡（推荐）'; // 4bit 微缩放（gpt-oss 官方格式）
     if (label.startsWith('Q8')) return '极高精度（几乎无损）';
     if (label.startsWith('Q6')) return '高精度';
     if (label.startsWith('Q5')) return '高质量';
@@ -52,17 +58,19 @@ class HfModel {
   String get author => id.contains('/') ? id.split('/').first : '';
   String get name => id.contains('/') ? id.split('/').last : id;
 
-  factory HfModel.fromJson(Map<String, dynamic> json) => HfModel(
-        id: json['id'] as String,
-        downloads: (json['downloads'] as num?)?.toInt() ?? 0,
-        likes: (json['likes'] as num?)?.toInt() ?? 0,
-        tags:
-            (json['tags'] as List?)?.map((e) => e.toString()).toList() ?? const [],
-        files: (json['files'] as List?)
-            ?.map((e) =>
-                HfModelFile.fromJson(json['id'] as String, e as Map<String, dynamic>))
-            .toList(),
-      );
+  factory HfModel.fromJson(Map<String, dynamic> json) {
+    final id = json['id'] as String;
+    return HfModel(
+      id: id,
+      downloads: (json['downloads'] as num?)?.toInt() ?? 0,
+      likes: (json['likes'] as num?)?.toInt() ?? 0,
+      tags:
+          (json['tags'] as List?)?.map((e) => e.toString()).toList() ?? const [],
+      files: (json['files'] as List?)
+          ?.map((e) => HfModelFile.fromJson(id, e as Map<String, dynamic>))
+          .toList(),
+    );
+  }
 }
 
 /// 仓库中的单个 GGUF 文件
@@ -72,7 +80,7 @@ class HfModelFile {
   final int sizeBytes;
   final String? sha256;   // HF LFS oid
 
-  const HfModelFile({
+  HfModelFile({
     required this.repoId,
     required this.path,
     required this.sizeBytes,
@@ -80,7 +88,9 @@ class HfModelFile {
   });
 
   String get fileName => path.split('/').last;
-  QuantLevel? get quant => QuantParser.parseFileName(fileName);
+
+  /// 量化解析结果惰性计算并缓存（实例不可变，避免每次访问重复执行正则）
+  late final QuantLevel? quant = QuantParser.parseFileName(fileName);
 
   factory HfModelFile.fromJson(String repoId, Map<String, dynamic> json) {
     final lfs = json['lfs'] as Map<String, dynamic>?;
