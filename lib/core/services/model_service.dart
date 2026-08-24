@@ -1,10 +1,8 @@
 import 'dart:convert';
 import 'dart:io';
-import 'package:dio/dio.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:edge_ai_app/core/models/hf_catalog_models.dart';
@@ -63,42 +61,9 @@ class ModelService {
   factory ModelService() => _instance;
   ModelService._internal();
 
-  final Dio _dio = Dio();
   late Directory _modelsDir;
   List<ModelInfo> _availableModels = [];
   String? _currentModelId;
-
-  /// 推荐模型列表 (Qwen3.5 系列)
-  final List<Map<String, dynamic>> recommendedModels = [
-    {
-      'id': 'qwen3.5-0.8b-q4km',
-      'name': 'Qwen3.5-0.8B-Instruct (Q4_K_M)',
-      'url': 'https://huggingface.co/bartowski/Qwen3.5-0.8B-Instruct-GGUF/resolve/main/Qwen3.5-0.8B-Instruct-Q4_K_M.gguf',
-      'size': 620 * 1024 * 1024, // ~620MB
-      'description': '平衡性能与体积，推荐大多数设备使用',
-    },
-    {
-      'id': 'qwen3.5-0.8b-q5km',
-      'name': 'Qwen3.5-0.8B-Instruct (Q5_K_M)',
-      'url': 'https://huggingface.co/bartowski/Qwen3.5-0.8B-Instruct-GGUF/resolve/main/Qwen3.5-0.8B-Instruct-Q5_K_M.gguf',
-      'size': 720 * 1024 * 1024, // ~720MB
-      'description': '更高精度，适合高端设备',
-    },
-    {
-      'id': 'qwen3.5-0.8b-q6k',
-      'name': 'Qwen3.5-0.8B-Instruct (Q6_K)',
-      'url': 'https://huggingface.co/bartowski/Qwen3.5-0.8B-Instruct-GGUF/resolve/main/Qwen3.5-0.8B-Instruct-Q6_K.gguf',
-      'size': 850 * 1024 * 1024, // ~850MB
-      'description': '最高精度，仅推荐旗舰设备',
-    },
-    {
-      'id': 'qwen2.5-0.5b-q4km',
-      'name': 'Qwen2.5-0.5B-Instruct (Q4_K_M)',
-      'url': 'https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf',
-      'size': 320 * 1024 * 1024, // ~320MB
-      'description': '轻量级，适合低端设备或快速测试',
-    },
-  ];
 
   static const String _fallbackAssetPath = 'assets/data/fallback_models.json';
 
@@ -200,45 +165,20 @@ class ModelService {
     return model.path;
   }
 
-  /// 下载模型 (带进度回调)
-  Future<void> downloadModel({
+  /// 自定义 URL 下载（统一走 DownloadManager，支持暂停/续传/校验）
+  Future<DownloadTask> downloadModel({
     required String url,
-    required String modelId,
     required String modelName,
-    Function(double progress)? onProgress,
   }) async {
-    // 请求存储权限 (仅 Android)
-    if (Platform.isAndroid) {
-      final status = await Permission.storage.status;
-      if (!status.isGranted) {
-        await Permission.storage.request();
-      }
+    final fileName = url.split('?').first.split('/').last;
+    if (!fileName.toLowerCase().endsWith('.gguf')) {
+      throw Exception('仅支持 .gguf 文件直链');
     }
-
-    final fileName = '${modelId.replaceAll('-', '_')}.gguf';
-    final savePath = '${_modelsDir.path}/$fileName';
-    
-    // 检查是否已存在
-    final existingFile = File(savePath);
-    if (await existingFile.exists()) {
-      throw Exception('模型文件已存在');
-    }
-
-    await _dio.download(
-      url,
-      savePath,
-      onReceiveProgress: (received, total) {
-        if (total != -1) {
-          final progress = received / total;
-          if (onProgress != null) {
-            onProgress(progress);
-          }
-        }
-      },
+    return DownloadManager.instance.start(
+      url: url,
+      displayName: modelName,
+      savePath: '${_modelsDir.path}/$fileName',
     );
-
-    // 重新扫描本地模型
-    await _scanLocalModels();
   }
 
   /// 从外部导入模型文件

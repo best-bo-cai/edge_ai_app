@@ -3,14 +3,18 @@ import 'package:flutter/material.dart';
 import 'features/chat/chat_screen.dart';
 import 'features/settings/model_management_screen.dart';
 import 'core/services/model_service.dart';
+import 'core/services/download_manager.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  
+
   // 初始化模型服务
   final modelService = ModelService();
   await modelService.init();
-  
+
+  // 恢复下载任务记录（断点续传）
+  await DownloadManager.instance.init();
+
   runApp(const EdgeMindApp());
 }
 
