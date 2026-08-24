@@ -25,22 +25,33 @@ class _ModelMarketScreenState extends State<ModelMarketScreen> {
   final ScrollController _scrollCtrl = ScrollController();
   final TextEditingController _searchCtrl = TextEditingController();
 
+  /// 分页大小（M4：searchModels 的 limit 与 _hasMore 判断共用的单一定义点）
+  static const int _pageSize = 30;
+
   Timer? _debounce;
   DeviceCapability? _capability;
   List<HfModel> _models = [];
+  Map<String, CompatibilityLevel> _compatLevels = {};
   bool _isFallback = false;
   bool _loading = false;
   bool _loadingMore = false;
+  bool _loadMoreFailed = false;
   bool _hasMore = true;
   String? _error;
   int _skip = 0;
   String? _query;
 
+  /// 异步竞态代际计数（I1）：每次 _loadInitial 递增，
+  /// 旧请求返回时因代际不一致被丢弃，避免污染新列表与 _skip
+  int _epoch = 0;
+
   @override
   void initState() {
     super.initState();
     _scrollCtrl.addListener(_onScroll);
-    _api.restoreHost().then((_) => _loadInitial());
+    _api.restoreHost().then((_) {
+      if (mounted) _loadInitial();
+    });
   }
 
   void _onScroll() {
@@ -52,31 +63,36 @@ class _ModelMarketScreenState extends State<ModelMarketScreen> {
   }
 
   Future<void> _loadInitial() async {
+    final epoch = ++_epoch;
     setState(() {
       _loading = true;
       _error = null;
       _models = [];
+      _compatLevels = {};
       _skip = 0;
       _hasMore = true;
+      _loadMoreFailed = false;
     });
     _capability ??= await DeviceCapabilityService().getCapability();
     try {
-      final models = await _api.searchModels(query: _query);
-      if (!mounted) return;
+      final models = await _api.searchModels(query: _query, limit: _pageSize);
+      if (!mounted || epoch != _epoch) return;
       setState(() {
         _models = models;
+        _compatLevels = _computeCompat(models);
         _isFallback = false;
         _skip = models.length;
-        _hasMore = models.length >= 30;
+        _hasMore = models.length >= _pageSize;
         _loading = false;
       });
     } catch (e) {
       // 网络异常兜底（需求 3.1）
       final fallback = await _modelService.loadFallbackModels();
-      if (!mounted) return;
+      if (!mounted || epoch != _epoch) return;
       setState(() {
         _isFallback = fallback.isNotEmpty;
         _models = fallback;
+        _compatLevels = _computeCompat(fallback);
         _hasMore = false;
         _loading = false;
         if (fallback.isEmpty) _error = '加载失败：$e';
@@ -86,24 +102,41 @@ class _ModelMarketScreenState extends State<ModelMarketScreen> {
 
   Future<void> _loadMore() async {
     if (_loadingMore) return;
-    setState(() => _loadingMore = true);
+    final epoch = _epoch;
+    setState(() {
+      _loadingMore = true;
+      _loadMoreFailed = false;
+    });
     try {
-      final more = await _api.searchModels(query: _query, skip: _skip);
-      if (!mounted) return;
+      final more =
+          await _api.searchModels(query: _query, limit: _pageSize, skip: _skip);
+      if (!mounted || epoch != _epoch) return;
       setState(() {
         _models.addAll(more);
+        _compatLevels.addAll(_computeCompat(more));
         _skip += more.length;
-        _hasMore = more.length >= 30;
+        _hasMore = more.length >= _pageSize;
       });
     } catch (_) {
-      if (mounted) {
+      if (mounted && epoch == _epoch) {
+        setState(() => _loadMoreFailed = true);
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(content: Text('加载更多失败，请检查网络')),
         );
       }
     } finally {
+      // 无论代际是否变化都复位加载态，避免新会话被卡死在 _loadingMore
       if (mounted) setState(() => _loadingMore = false);
     }
+  }
+
+  /// 数据落地时预计算兼容等级（M3：避免 _ModelCard 每次 build 重跑正则）
+  Map<String, CompatibilityLevel> _computeCompat(List<HfModel> models) {
+    final cap = _capability;
+    if (cap == null) return {};
+    return {
+      for (final m in models) m.id: CompatibilityEngine.evaluateModel(cap, m),
+    };
   }
 
   void _onSearchChanged(String value) {
@@ -155,24 +188,50 @@ class _ModelMarketScreenState extends State<ModelMarketScreen> {
                         child: ListView.builder(
                           controller: _scrollCtrl,
                           physics: const AlwaysScrollableScrollPhysics(),
-                          itemCount: _models.length + (_hasMore ? 1 : 0),
+                          itemCount: _models.isEmpty
+                              ? 1
+                              : _models.length +
+                                  ((_loadingMore || _loadMoreFailed) ? 1 : 0),
                           itemBuilder: (context, index) {
+                            if (_models.isEmpty) {
+                              // 搜索空结果空态（M2）：仍处于可滚动列表内，下拉刷新可用
+                              return _EmptyView(
+                                message: _query != null ? '未找到匹配模型' : '暂无模型',
+                              );
+                            }
                             if (index >= _models.length) {
+                              // 尾部项（M1）：加载中显示指示器，失败显示"点击重试"
+                              if (_loadMoreFailed) {
+                                return InkWell(
+                                  onTap: _loadMore,
+                                  child: const Padding(
+                                    padding: EdgeInsets.all(16),
+                                    child: Center(
+                                      child: Text(
+                                        '点击重试',
+                                        style: TextStyle(color: Colors.blue),
+                                      ),
+                                    ),
+                                  ),
+                                );
+                              }
                               return const Padding(
                                 padding: EdgeInsets.all(16),
                                 child: Center(
-                                    child:
-                                        CircularProgressIndicator(strokeWidth: 2)),
+                                    child: CircularProgressIndicator(
+                                        strokeWidth: 2)),
                               );
                             }
                             final model = _models[index];
                             return _ModelCard(
                               model: model,
-                              capability: _capability,
+                              level: _compatLevels[model.id] ??
+                                  CompatibilityLevel.unknown,
                               onTap: () => Navigator.push(
                                 context,
                                 MaterialPageRoute(
-                                  builder: (_) => ModelDetailScreen(model: model),
+                                  builder: (_) =>
+                                      ModelDetailScreen(model: model),
                                 ),
                               ),
                             );
@@ -229,19 +288,18 @@ class _ModelMarketScreenState extends State<ModelMarketScreen> {
 class _ModelCard extends StatelessWidget {
   const _ModelCard({
     required this.model,
-    required this.capability,
+    required this.level,
     required this.onTap,
   });
 
   final HfModel model;
-  final DeviceCapability? capability;
+
+  /// 预计算的兼容等级（M3：由列表数据落地时统一计算传入）
+  final CompatibilityLevel level;
   final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
-    final level = capability == null
-        ? CompatibilityLevel.unknown
-        : CompatibilityEngine.evaluateModel(capability!, model);
     return Card(
       margin: const EdgeInsets.symmetric(horizontal: 16, vertical: 6),
       child: InkWell(
@@ -323,6 +381,27 @@ class _ModelCard extends StatelessWidget {
     if (n >= 1000000) return '${(n / 1000000).toStringAsFixed(1)}M';
     if (n >= 1000) return '${(n / 1000).toStringAsFixed(1)}K';
     return '$n';
+  }
+}
+
+/// 空态视图（M2：搜索无结果时展示；作为列表项渲染以保留下拉刷新）
+class _EmptyView extends StatelessWidget {
+  const _EmptyView({required this.message});
+
+  final String message;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 96),
+      child: Column(
+        children: [
+          const Icon(Icons.search_off, size: 48, color: Colors.grey),
+          const SizedBox(height: 12),
+          Text(message, style: const TextStyle(color: Colors.grey)),
+        ],
+      ),
+    );
   }
 }
 
