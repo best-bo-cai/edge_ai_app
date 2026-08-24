@@ -55,6 +55,19 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
   String _savePathFor(HfModelFile file) =>
       '${_modelService.modelsDirPath}/${file.repoId.split('/').first}/${file.fileName}';
 
+  /// 可展示的量化文件：过滤掉超出本机配置的版本（无法运行的不提供下载）
+  List<HfModelFile> get _visibleFiles {
+    final files = _files;
+    if (files == null) return const [];
+    final cap = _capability;
+    if (cap == null) return files;
+    return files
+        .where((f) =>
+            CompatibilityEngine.evaluateFile(cap, f) !=
+            CompatibilityLevel.overkill)
+        .toList();
+  }
+
   /// 下载前拦截校验：存储空间（需求 2.4：≥ 文件+2GB）+ 蜂窝网络提醒
   Future<void> _onDownloadFile(HfModelFile file) async {
     final cap = _capability;
@@ -137,6 +150,7 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final visibleFiles = _visibleFiles;
     return Scaffold(
       appBar: AppBar(title: const Text('模型详情')),
       body: _loading
@@ -158,13 +172,41 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
                   children: [
                     _buildRepoCard(),
                     const SizedBox(height: 16),
-                    const Text('量化版本',
-                        style: TextStyle(
-                            fontSize: 16, fontWeight: FontWeight.bold)),
-                    const SizedBox(height: 8),
-                    ..._files!.map(_buildFileCard),
+                    if (visibleFiles.isEmpty)
+                      _buildAllOverkillCard()
+                    else ...[
+                      const Text('量化版本',
+                          style: TextStyle(
+                              fontSize: 16, fontWeight: FontWeight.bold)),
+                      const SizedBox(height: 8),
+                      ...visibleFiles.map(_buildFileCard),
+                    ],
                   ],
                 ),
+    );
+  }
+
+  /// 所有量化版本均超出本机配置时的提示卡片
+  Widget _buildAllOverkillCard() {
+    final usable = _capability?.usableRamBytes;
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          children: [
+            const Icon(Icons.block, size: 40, color: Colors.grey),
+            const SizedBox(height: 12),
+            const Text('该模型的所有量化版本均超出本机配置',
+                style: TextStyle(fontWeight: FontWeight.bold)),
+            const SizedBox(height: 4),
+            Text(
+              '本机模型可用内存约 ${usable == null ? '未知' : _fmtBytes(usable)}，无法流畅运行此模型',
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
     );
   }
 

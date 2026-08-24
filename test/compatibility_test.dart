@@ -39,58 +39,87 @@ void main() {
     });
   });
 
-  group('evaluateModel 列表级粗筛', () {
-    test('4GB 设备：0.5B 完美适配', () {
+  group('usableRamBytes 模型可用内存预算', () {
+    test('物理内存的一半', () {
+      expect(cap(16).usableRamBytes, 8 * gb);
+      expect(cap(4).usableRamBytes, 2 * gb);
+    });
+    test('RAM 未知按 4GB 估算 → 可用 2GB', () {
+      const unknown = DeviceCapability(totalRamBytes: null, cpuCores: 8, abi: 'x');
+      expect(unknown.usableRamBytes, 2 * gb);
+    });
+  });
+
+  group('evaluateModel 列表级粗筛（按模型可用内存 = 物理一半分档）', () {
+    test('4GB 设备（可用 2GB → 档位上限 1.0B）：0.5B 完美适配', () {
       const m = HfModel(id: 'a/Qwen2.5-0.5B-Instruct-GGUF');
       expect(CompatibilityEngine.evaluateModel(cap(4), m), CompatibilityLevel.perfect);
     });
-    // 4GB 属 4-6GB 档（上限 1.5B）：1.5B 恰好达档 → perfect；
-    // 2B 落在 (1.5, 1.5×1.5] → runnable；3B 超出 → overkill
-    test('4GB 设备：1.5B 完美、2B 可运行、3B 超出', () {
+    // 可用 2GB → 分档上限 1.0B：1.5B 落在 (1.0, 1.0×1.5] → runnable；2B/3B 超出
+    test('4GB 设备：1.5B 可运行、2B/3B 超出', () {
       expect(CompatibilityEngine.evaluateModel(cap(4), const HfModel(id: 'a/Qwen2.5-1.5B-Instruct-GGUF')),
-          CompatibilityLevel.perfect);
-      expect(CompatibilityEngine.evaluateModel(cap(4), const HfModel(id: 'a/gemma-2-2b-it-GGUF')),
           CompatibilityLevel.runnable);
+      expect(CompatibilityEngine.evaluateModel(cap(4), const HfModel(id: 'a/gemma-2-2b-it-GGUF')),
+          CompatibilityLevel.overkill);
       expect(CompatibilityEngine.evaluateModel(cap(4), const HfModel(id: 'a/Qwen2.5-3B-Instruct-GGUF')),
           CompatibilityLevel.overkill);
     });
-    test('8GB 设备：7B 完美适配', () {
+    test('8GB 设备（可用 4GB → 档位上限 1.5B）：2B 可运行、3B/7B 超出', () {
+      expect(CompatibilityEngine.evaluateModel(cap(8), const HfModel(id: 'a/gemma-2-2b-it-GGUF')),
+          CompatibilityLevel.runnable);
+      expect(CompatibilityEngine.evaluateModel(cap(8), const HfModel(id: 'a/Qwen2.5-3B-Instruct-GGUF')),
+          CompatibilityLevel.overkill);
       expect(CompatibilityEngine.evaluateModel(cap(8), const HfModel(id: 'a/Mistral-7B-Instruct-v0.3-GGUF')),
-          CompatibilityLevel.perfect);
+          CompatibilityLevel.overkill);
     });
-    test('关键词兜底：TinyLlama 视为 0.7B', () {
-      expect(CompatibilityEngine.evaluateModel(cap(4), const HfModel(id: 'a/TinyLlama-1.1B-Chat-v1.0-GGUF')),
+    // 用户真实场景：16GB 标称机型（物理约 14.8GB，可用约 7.4GB → 档位上限 3.0B）
+    test('16GB 标称机型：3B 完美、4B 可运行、7B 超出（不再展示）', () {
+      expect(CompatibilityEngine.evaluateModel(cap(15), const HfModel(id: 'a/Qwen2.5-3B-Instruct-GGUF')),
           CompatibilityLevel.perfect);
+      expect(CompatibilityEngine.evaluateModel(cap(15), const HfModel(id: 'a/Qwen3-4B-GGUF')),
+          CompatibilityLevel.runnable);
+      expect(CompatibilityEngine.evaluateModel(cap(15), const HfModel(id: 'a/Qwen2.5-7B-Instruct-GGUF')),
+          CompatibilityLevel.overkill);
+    });
+    test('关键词兜底：tinyllama-chat 视为 0.7B → 4GB 设备完美', () {
       const noParam = HfModel(id: 'a/tinyllama-chat');
       expect(CompatibilityEngine.evaluateModel(cap(4), noParam), CompatibilityLevel.perfect);
+      // TinyLlama-1.1B 提取 1.1 > 1.0 档位 → 可运行
+      expect(CompatibilityEngine.evaluateModel(cap(4), const HfModel(id: 'a/TinyLlama-1.1B-Chat-v1.0-GGUF')),
+          CompatibilityLevel.runnable);
     });
     test('无法判断 → unknown', () {
       expect(CompatibilityEngine.evaluateModel(cap(8), const HfModel(id: 'a/some-model-gguf')),
           CompatibilityLevel.unknown);
     });
-    // runnable 上边界：params 恰为 tier×1.5 = 1.5×1.5 = 2.25B 时仍可运行
-    test('4GB 设备：2.25B 恰达 runnable 上边界 → 可运行', () {
-      expect(CompatibilityEngine.evaluateModel(cap(4), const HfModel(id: 'a/model-2.25B-GGUF')),
+    // runnable 上边界：可用 4GB 档 tier=1.5，params 恰为 2.25B 时仍可运行
+    test('8GB 设备：2.25B 恰达 runnable 上边界 → 可运行', () {
+      expect(CompatibilityEngine.evaluateModel(cap(8), const HfModel(id: 'a/model-2.25B-GGUF')),
           CompatibilityLevel.runnable);
     });
-    test('RAM 未知按 4GB 保守分档', () {
+    test('RAM 未知按 4GB 保守分档（可用 2GB）', () {
       const unknown = DeviceCapability(totalRamBytes: null, cpuCores: 8, abi: 'x');
       expect(CompatibilityEngine.evaluateModel(unknown, const HfModel(id: 'a/Qwen2.5-7B-GGUF')),
           CompatibilityLevel.overkill);
     });
   });
 
-  group('evaluateFile 文件级精确判断', () {
-    test('8GB 设备 + 2GB 文件 → 完美适配', () {
-      final f = HfModelFile(repoId: 'a/b', path: 'x-q4_k_m.gguf', sizeBytes: 2 * gb);
+  group('evaluateFile 文件级精确判断（按模型可用内存 = 物理一半）', () {
+    // 8GB 设备 → 可用 4GB：perfect ≤ 2.4GB 需求，runnable ≤ 3.4GB 需求
+    test('8GB 设备 + 1.5GB 文件 → 完美适配', () {
+      final f = HfModelFile(repoId: 'a/b', path: 'x-q4_k_m.gguf', sizeBytes: (1.5 * gb).round());
       expect(CompatibilityEngine.evaluateFile(cap(8), f), CompatibilityLevel.perfect);
     });
-    test('8GB 设备 + 4.5GB 文件 → 可运行', () {
-      final f = HfModelFile(repoId: 'a/b', path: 'x-q4_k_m.gguf', sizeBytes: (4.5 * gb).round());
+    test('8GB 设备 + 2.8GB 文件 → 可运行', () {
+      final f = HfModelFile(repoId: 'a/b', path: 'x-q4_k_m.gguf', sizeBytes: (2.8 * gb).round());
       expect(CompatibilityEngine.evaluateFile(cap(8), f), CompatibilityLevel.runnable);
     });
-    test('4GB 设备 + 4GB 文件 → 超出', () {
+    test('8GB 设备 + 4GB 文件 → 超出', () {
       final f = HfModelFile(repoId: 'a/b', path: 'x-q4_k_m.gguf', sizeBytes: 4 * gb);
+      expect(CompatibilityEngine.evaluateFile(cap(8), f), CompatibilityLevel.overkill);
+    });
+    test('4GB 设备（可用 2GB）+ 2.4GB 文件 → 超出', () {
+      final f = HfModelFile(repoId: 'a/b', path: 'x-q4_k_m.gguf', sizeBytes: (2.4 * gb).round());
       expect(CompatibilityEngine.evaluateFile(cap(4), f), CompatibilityLevel.overkill);
     });
     // 脏数据防御：size 缺失（fromJson 默认 0）或为负时不做判断

@@ -75,29 +75,60 @@ class _ModelMarketScreenState extends State<ModelMarketScreen> {
     });
     _capability ??= await DeviceCapabilityService().getCapability();
     try {
-      final models = await _api.searchModels(query: _query, limit: _pageSize);
+      final (shown, consumed, hasMore) =
+          await _fetchVisible(query: _query, skip: 0);
       if (!mounted || epoch != _epoch) return;
       setState(() {
-        _models = models;
-        _compatLevels = _computeCompat(models);
+        _models = shown;
+        _compatLevels = _computeCompat(shown);
         _isFallback = false;
-        _skip = models.length;
-        _hasMore = models.length >= _pageSize;
+        _skip = consumed;
+        _hasMore = hasMore;
         _loading = false;
       });
     } catch (e) {
       // 网络异常兜底（需求 3.1）
       final fallback = await _modelService.loadFallbackModels();
       if (!mounted || epoch != _epoch) return;
+      final visibleFallback = _filterCompatible(fallback);
       setState(() {
         _isFallback = fallback.isNotEmpty;
-        _models = fallback;
-        _compatLevels = _computeCompat(fallback);
+        _models = visibleFallback;
+        _compatLevels = _computeCompat(visibleFallback);
         _hasMore = false;
         _loading = false;
         if (fallback.isEmpty) _error = '加载失败：$e';
       });
     }
+  }
+
+  /// 过滤掉超出设备配置的模型（用户决策：无法运行的模型不展示）
+  List<HfModel> _filterCompatible(List<HfModel> models) {
+    final cap = _capability;
+    if (cap == null) return models;
+    return models
+        .where((m) =>
+            CompatibilityEngine.evaluateModel(cap, m) !=
+            CompatibilityLevel.overkill)
+        .toList();
+  }
+
+  /// 拉取并过滤一页数据；若整页都被过滤掉（热门榜常被大模型占据）则自动
+  /// 向后多拉（首屏最多 3 页），避免出现空列表。返回：
+  /// (可见模型, 已消费的原始条数, 是否可能还有下一页)
+  Future<(List<HfModel>, int, bool)> _fetchVisible(
+      {String? query, required int skip}) async {
+    var consumed = 0;
+    var hasMore = false;
+    for (var page = 0; page <= 3; page++) {
+      final raw = await _api.searchModels(
+          query: query, limit: _pageSize, skip: skip + consumed);
+      consumed += raw.length;
+      hasMore = raw.length >= _pageSize;
+      final shown = _filterCompatible(raw);
+      if (shown.isNotEmpty || !hasMore) return (shown, consumed, hasMore);
+    }
+    return (const <HfModel>[], consumed, hasMore);
   }
 
   Future<void> _loadMore() async {
@@ -108,14 +139,14 @@ class _ModelMarketScreenState extends State<ModelMarketScreen> {
       _loadMoreFailed = false;
     });
     try {
-      final more =
-          await _api.searchModels(query: _query, limit: _pageSize, skip: _skip);
+      final (shown, consumed, hasMore) =
+          await _fetchVisible(query: _query, skip: _skip);
       if (!mounted || epoch != _epoch) return;
       setState(() {
-        _models.addAll(more);
-        _compatLevels.addAll(_computeCompat(more));
-        _skip += more.length;
-        _hasMore = more.length >= _pageSize;
+        _models.addAll(shown);
+        _compatLevels.addAll(_computeCompat(shown));
+        _skip += consumed;
+        _hasMore = hasMore;
       });
     } catch (_) {
       if (mounted && epoch == _epoch) {
@@ -196,7 +227,9 @@ class _ModelMarketScreenState extends State<ModelMarketScreen> {
                             if (_models.isEmpty) {
                               // 搜索空结果空态（M2）：仍处于可滚动列表内，下拉刷新可用
                               return _EmptyView(
-                                message: _query != null ? '未找到匹配模型' : '暂无模型',
+                                message: _query != null
+                                    ? '未找到匹配模型'
+                                    : '暂无适配本机配置的模型',
                               );
                             }
                             if (index >= _models.length) {
@@ -258,7 +291,7 @@ class _ModelMarketScreenState extends State<ModelMarketScreen> {
             const SizedBox(width: 8),
             Expanded(
               child: Text(
-                '本机配置：${cap.isEstimated ? '≈' : ''}$gb GB 物理内存 · ${cap.cpuCores} 核 · ${cap.abi}'
+                '本机配置：${cap.isEstimated ? '≈' : ''}$gb GB 物理内存 · 模型可用约 ${_fmtBytes(cap.usableRamBytes)} · ${cap.cpuCores} 核 · ${cap.abi}'
                 '${cap.freeDiskBytes != null ? ' · 可用存储 ${_fmtBytes(cap.freeDiskBytes!)}' : ''}',
                 style: const TextStyle(fontSize: 12, color: Colors.black54),
               ),
