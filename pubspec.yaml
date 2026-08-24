@@ -19,8 +19,6 @@ dependencies:
   dio: ^5.4.3+1
   # 文件选择 (外部导入)
   file_picker: ^8.0.7
-  # 权限处理 (安卓存储权限)
-  permission_handler: ^11.3.1
   # 本地存储 (记录默认模型)
   shared_preferences: ^2.2.3
   # 文件名处理

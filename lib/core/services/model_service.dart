@@ -129,17 +129,21 @@ class ModelService {
   /// I4: 递归扫描子目录（models/{author}/{fileName}），
   /// 兼容平铺在 models 根目录的旧文件
   Future<void> _scanLocalModels() async {
-    _availableModels.clear();
+    // M6: 先收集全部条目再一次性赋值，消除 await 期间暴露半成品列表的中间态
+    final models = <ModelInfo>[];
 
     final entries = _modelsDir.listSync(recursive: true);
     for (final entry in entries) {
-      if (entry is File && entry.path.endsWith('.gguf')) {
+      // I1: 与 downloadModel 的大小写不敏感校验一致，防 .GGUF 下载后不可见
+      if (entry is File && entry.path.toLowerCase().endsWith('.gguf')) {
         final stat = await entry.stat();
         final fileName = entry.uri.pathSegments.last;
-        
-        _availableModels.add(ModelInfo(
-          id: fileName.replaceAll('.gguf', '').toLowerCase().replaceAll('_', '-'),
-          name: fileName.replaceAll('.gguf', ''),
+        final baseName =
+            fileName.substring(0, fileName.length - '.gguf'.length);
+
+        models.add(ModelInfo(
+          id: baseName.toLowerCase().replaceAll('_', '-'),
+          name: baseName,
           path: entry.path,
           sizeBytes: stat.size,
           isDownloaded: true,
@@ -147,6 +151,7 @@ class ModelService {
         ));
       }
     }
+    _availableModels = models;
   }
 
   /// 获取所有可用模型
@@ -189,7 +194,8 @@ class ModelService {
       throw Exception('源文件不存在');
     }
 
-    if (!sourcePath.endsWith('.gguf')) {
+    // I1: 与 downloadModel 的大小写不敏感校验一致，兼容 .GGUF 扩展名
+    if (!sourcePath.toLowerCase().endsWith('.gguf')) {
       throw Exception('仅支持 .gguf 格式的模型文件');
     }
 
@@ -199,7 +205,8 @@ class ModelService {
     // 如果已存在，添加时间戳
     if (await File(destPath).exists()) {
       final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final baseName = fileName.replaceAll('.gguf', '');
+      final baseName =
+          fileName.substring(0, fileName.length - '.gguf'.length);
       final newFileName = '${baseName}_$timestamp.gguf';
       destPath = '${_modelsDir.path}/$newFileName';
     }
@@ -264,11 +271,6 @@ class ModelService {
       orElse: () => throw Exception('模型不存在'),
     );
     await switchModel(model.id);
-  }
-
-  /// 检查模型是否已下载
-  bool isModelDownloaded(String modelId) {
-    return _availableModels.any((m) => m.id == modelId && m.isDownloaded);
   }
 
   /// 获取模型下载状态

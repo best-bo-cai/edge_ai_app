@@ -17,24 +17,33 @@ class ModelManagementScreen extends StatefulWidget {
 class _ModelManagementScreenState extends State<ModelManagementScreen> {
   final ModelService _modelService = ModelService();
   final TextEditingController _urlController = TextEditingController();
-  
-  // 下载状态跟踪（DownloadManager 事件驱动）
-  DownloadTask? _activeTask;
+
+  // 下载任务跟踪（DownloadManager 事件驱动 + 重启回填）
+  List<DownloadTask> _pendingTasks = const [];
   StreamSubscription<DownloadTask>? _dlSub;
   bool _isImporting = false;
 
-  bool get _isDownloading =>
-      _activeTask?.status == DownloadStatus.downloading ||
-      _activeTask?.status == DownloadStatus.verifying ||
-      _activeTask?.status == DownloadStatus.queued;
+  bool get _isDownloading => _pendingTasks.any((t) =>
+      t.status == DownloadStatus.downloading ||
+      t.status == DownloadStatus.verifying ||
+      t.status == DownloadStatus.queued);
+
+  /// 未完成的下载任务（含排队/下载/暂停/校验/失败）
+  List<DownloadTask> _pendingTasksOf() =>
+      DownloadManager.instance.tasks
+          .where((t) => t.status != DownloadStatus.completed)
+          .toList();
 
   @override
   void initState() {
     super.initState();
     _refreshModels();
+    // I2: 杀进程重启后 DownloadManager.init() 恢复的任务记录无事件可监听，
+    // 须在此回填，否则自定义 URL 任务将失去"继续/取消"入口
+    _pendingTasks = _pendingTasksOf();
     _dlSub = DownloadManager.instance.events.listen((t) {
       if (!mounted) return;
-      setState(() => _activeTask = DownloadManager.instance.taskOf(t.id));
+      setState(() => _pendingTasks = _pendingTasksOf());
       // 下载完成后刷新已下载列表（管理页常驻 IndexedStack，需事件驱动刷新）
       if (t.status == DownloadStatus.completed) {
         _refreshModels();
@@ -216,6 +225,12 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
 
             const SizedBox(height: 24),
 
+            // I2: 下载任务区块（含杀进程重启后恢复的任务）
+            if (_pendingTasks.isNotEmpty) ...[
+              _buildDownloadTasksSection(),
+              const SizedBox(height: 24),
+            ],
+
             // 导入按钮
             _buildImportButton(),
 
@@ -275,20 +290,160 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
               ),
               enabled: !_isDownloading,
             ),
-            if (_activeTask != null && _isDownloading) ...[
-              const SizedBox(height: 12),
-              LinearProgressIndicator(value: _activeTask!.progress),
-              const SizedBox(height: 4),
+            // I2: 进度展示移至"下载任务"区块统一承载（覆盖全部任务来源）
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// I2: 下载任务区块——渲染全部未完成任务（含重启恢复的），
+  /// 提供暂停/继续/取消/重试入口
+  Widget _buildDownloadTasksSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Text(
+          '下载任务',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 12),
+        ..._pendingTasks.map(_buildDownloadTaskCard),
+      ],
+    );
+  }
+
+  Widget _buildDownloadTaskCard(DownloadTask task) {
+    return Card(
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    task.displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        fontSize: 15, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                _buildTaskActions(task),
+              ],
+            ),
+            const SizedBox(height: 8),
+            LinearProgressIndicator(
+              // 总大小未知（totalBytes = -1）时走不定进度动画
+              value: task.totalBytes > 0 ? task.progress : null,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              _taskStatusLine(task),
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+            if (task.status == DownloadStatus.failed &&
+                task.error != null) ...[
+              const SizedBox(height: 2),
               Text(
-                '${(_activeTask!.progress * 100).toStringAsFixed(1)}%'
-                '${_activeTask!.status == DownloadStatus.verifying ? " · 校验中" : ""}',
-                style: const TextStyle(fontSize: 12),
+                task.error!,
+                style: const TextStyle(fontSize: 11, color: Colors.red),
               ),
             ],
           ],
         ),
       ),
     );
+  }
+
+  /// 按状态渲染操作按钮：downloading → 暂停；paused → 继续+取消；
+  /// queued → 取消排队；failed → 重试；verifying 无操作
+  Widget _buildTaskActions(DownloadTask task) {
+    switch (task.status) {
+      case DownloadStatus.downloading:
+        return IconButton(
+          tooltip: '暂停',
+          icon: const Icon(Icons.pause),
+          onPressed: () => DownloadManager.instance.pause(task.id),
+        );
+      case DownloadStatus.paused:
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextButton(
+              onPressed: () => DownloadManager.instance.resume(task.id),
+              child: const Text('继续'),
+            ),
+            IconButton(
+              tooltip: '取消并删除',
+              icon: const Icon(Icons.close, color: Colors.red),
+              onPressed: () => DownloadManager.instance.cancel(task.id),
+            ),
+          ],
+        );
+      case DownloadStatus.queued:
+        return IconButton(
+          tooltip: '取消排队',
+          icon: const Icon(Icons.close, color: Colors.red),
+          onPressed: () => DownloadManager.instance.cancel(task.id),
+        );
+      case DownloadStatus.failed:
+        return TextButton(
+          onPressed: () => DownloadManager.instance.resume(task.id),
+          child: const Text('重试'),
+        );
+      case DownloadStatus.verifying:
+      case DownloadStatus.completed:
+        return const SizedBox.shrink();
+    }
+  }
+
+  String _taskStatusLine(DownloadTask task) {
+    final buffer = StringBuffer(_statusLabelOf(task.status));
+    if (task.totalBytes > 0) {
+      buffer.write(' · ${(task.progress * 100).toStringAsFixed(1)}%');
+    } else if (task.receivedBytes > 0) {
+      buffer.write(' · 已下载 ${_fmtBytes(task.receivedBytes)}');
+    }
+    if (task.status == DownloadStatus.downloading && task.speedBps > 0) {
+      buffer.write(' · ${_fmtSpeed(task.speedBps)}');
+    }
+    return buffer.toString();
+  }
+
+  String _statusLabelOf(DownloadStatus status) {
+    switch (status) {
+      case DownloadStatus.queued:
+        return '排队中';
+      case DownloadStatus.downloading:
+        return '下载中';
+      case DownloadStatus.paused:
+        return '已暂停';
+      case DownloadStatus.verifying:
+        return '校验中';
+      case DownloadStatus.completed:
+        return '已完成';
+      case DownloadStatus.failed:
+        return '失败';
+    }
+  }
+
+  String _fmtBytes(int bytes) {
+    if (bytes >= 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+    }
+    if (bytes >= 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  }
+
+  String _fmtSpeed(double bps) {
+    if (bps < 1024) return '${bps.toStringAsFixed(0)} B/s';
+    if (bps < 1024 * 1024) return '${(bps / 1024).toStringAsFixed(0)} KB/s';
+    return '${(bps / 1024 / 1024).toStringAsFixed(1)} MB/s';
   }
 
   Widget _buildImportButton() {
