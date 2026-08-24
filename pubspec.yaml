@@ -25,6 +25,8 @@ dependencies:
   shared_preferences: ^2.2.3
   # 文件名处理
   path: ^1.9.0
+  # 设备信息 (CPU ABI)
+  device_info_plus: ^10.1.0
 
 dev_dependencies:
   flutter_test:
