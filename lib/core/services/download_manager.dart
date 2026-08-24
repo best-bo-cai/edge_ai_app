@@ -5,6 +5,7 @@ import 'dart:io';
 
 import 'package:crypto/crypto.dart';
 import 'package:dio/dio.dart';
+import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 /// 下载任务状态（见技术设计 4.4 状态机）
@@ -12,10 +13,10 @@ enum DownloadStatus { queued, downloading, paused, verifying, completed, failed 
 
 class DownloadTask {
   final String id;          // = savePath
-  final String url;
+  String url;
   final String displayName;
   final String savePath;    // 最终 .gguf 路径
-  final String? expectedSha256;
+  String? expectedSha256;
 
   int totalBytes;           // -1 = 未知
   int receivedBytes = 0;
@@ -80,6 +81,12 @@ class DownloadManager {
 
   final Dio _dio;
   final Map<String, DownloadTask> _tasks = {};
+
+  /// 串行队列（技术设计：单任务串行省电）——同一时刻仅 1 个任务在下载，
+  /// 后续任务置 queued 排队，前序结束（完成/暂停/失败/取消）后自动启动
+  DownloadTask? _active;
+  final List<DownloadTask> _queue = [];
+
   final StreamController<DownloadTask> _events =
       StreamController<DownloadTask>.broadcast();
 
@@ -94,19 +101,33 @@ class DownloadManager {
       final prefs = await SharedPreferences.getInstance();
       final raw = prefs.getString(_prefsKey);
       if (raw == null) return;
-      for (final e in (jsonDecode(raw) as List)) {
-        final task = DownloadTask.fromJson(e as Map<String, dynamic>);
-        if (task.status == DownloadStatus.downloading ||
-            task.status == DownloadStatus.queued ||
-            task.status == DownloadStatus.verifying) {
-          task.status = DownloadStatus.paused;
-        }
-        if (await File(task.partPath).exists() ||
-            await File(task.savePath).exists()) {
-          _tasks[task.id] = task;
+      final List<dynamic> records;
+      try {
+        records = jsonDecode(raw) as List;
+      } catch (e) {
+        debugPrint('[DownloadManager] 任务记录解析失败: $e');
+        return;
+      }
+      for (final record in records) {
+        try {
+          final task = DownloadTask.fromJson(record as Map<String, dynamic>);
+          if (task.status == DownloadStatus.downloading ||
+              task.status == DownloadStatus.queued ||
+              task.status == DownloadStatus.verifying) {
+            task.status = DownloadStatus.paused;
+          }
+          if (await File(task.partPath).exists() ||
+              await File(task.savePath).exists()) {
+            _tasks[task.id] = task;
+          }
+        } catch (e) {
+          // 单条记录损坏不影响其余任务恢复
+          debugPrint('[DownloadManager] 恢复任务失败，已跳过: $e');
         }
       }
-    } catch (_) {}
+    } catch (e) {
+      debugPrint('[DownloadManager] init 失败: $e');
+    }
   }
 
   /// 开始（或继续）一个下载任务
@@ -118,21 +139,52 @@ class DownloadManager {
     String? expectedSha256,
   }) async {
     final existing = _tasks[savePath];
-    if (existing != null && existing.status == DownloadStatus.completed) {
+
+    // C1: 任务已在下载/校验中直接返回，杜绝同任务并发双 _run 双写 .part
+    if (existing != null &&
+        (existing.status == DownloadStatus.downloading ||
+            existing.status == DownloadStatus.verifying)) {
       return existing;
     }
-    if (await File(savePath).exists()) {
+
+    final fileExists = await File(savePath).exists();
+
+    // completed 短路前先确认文件仍在，文件已丢失则重新下载
+    if (existing != null &&
+        existing.status == DownloadStatus.completed &&
+        fileExists) {
+      return existing;
+    }
+    if (fileExists) {
       throw Exception('文件已存在，请先删除后重新下载');
     }
-    final task = existing ??
-        DownloadTask(
-          id: savePath,
-          url: url,
-          displayName: displayName,
-          savePath: savePath,
-          totalBytes: totalBytes,
-          expectedSha256: expectedSha256,
-        );
+
+    final DownloadTask task;
+    if (existing != null) {
+      // 已存在的非运行任务更新下载参数
+      if (existing.url != url) {
+        // 旧 .part 属于旧 url，不能续传复用
+        existing.receivedBytes = 0;
+        try {
+          final stale = File(existing.partPath);
+          if (await stale.exists()) await stale.delete();
+        } catch (_) {}
+      }
+      existing.url = url;
+      existing.expectedSha256 = expectedSha256;
+      if (totalBytes > 0) existing.totalBytes = totalBytes;
+      task = existing;
+    } else {
+      task = DownloadTask(
+        id: savePath,
+        url: url,
+        displayName: displayName,
+        savePath: savePath,
+        totalBytes: totalBytes,
+        expectedSha256: expectedSha256,
+      );
+    }
+    task._retryCount = 0;
     _tasks[task.id] = task;
     unawaited(_run(task));
     return task;
@@ -141,7 +193,14 @@ class DownloadManager {
   /// 暂停：取消当前请求，保留 .part
   Future<void> pause(String id) async {
     final task = _tasks[id];
-    if (task == null || task.status != DownloadStatus.downloading) return;
+    if (task == null) return;
+    if (task.status == DownloadStatus.queued) {
+      _queue.remove(task);
+      task.status = DownloadStatus.paused;
+      _emit(task);
+      return;
+    }
+    if (task.status != DownloadStatus.downloading) return;
     task._cancelToken?.cancel('用户暂停');
   }
 
@@ -149,6 +208,12 @@ class DownloadManager {
   Future<void> resume(String id) async {
     final task = _tasks[id];
     if (task == null || task.status == DownloadStatus.completed) return;
+    // C1: 下载/校验中不可重复启动；排队中无需重复入队
+    if (task.status == DownloadStatus.downloading ||
+        task.status == DownloadStatus.verifying ||
+        task.status == DownloadStatus.queued) {
+      return;
+    }
     task._retryCount = 0;
     unawaited(_run(task));
   }
@@ -159,117 +224,203 @@ class DownloadManager {
     if (task == null) return;
     task._cancelToken?.cancel('用户取消');
     _tasks.remove(id);
-    final part = File(task.partPath);
-    if (await part.exists()) await part.delete();
+    _queue.remove(task);
+    try {
+      final part = File(task.partPath);
+      if (await part.exists()) await part.delete();
+    } catch (e) {
+      // 删除失败不阻断取消流程
+      debugPrint('[DownloadManager] 删除 .part 失败: $e');
+    }
     _persist();
-    _events.add(task);
+    _emit(task);
   }
 
   Future<void> _run(DownloadTask task) async {
-    task.status = DownloadStatus.downloading;
-    task.error = null;
-    task.speedBps = 0;
-    _emit(task);
-
-    final partFile = File(task.partPath);
-    int startByte = 0;
-    if (await partFile.exists()) {
-      startByte = await partFile.length();
-    }
-
-    task._cancelToken = CancelToken();
-    IOSink? sink;
-    try {
-      final response = await _dio.get<ResponseBody>(
-        task.url,
-        cancelToken: task._cancelToken,
-        options: Options(
-          responseType: ResponseType.stream,
-          headers: startByte > 0 ? {'Range': 'bytes=$startByte-'} : null,
-        ),
-      );
-
-      // 206 = 服务器接受续传；200 = 忽略 Range 需重写
-      final isResume = response.statusCode == 206;
-      final stream = response.data!.stream;
-
-      if (isResume) {
-        // content-range: bytes start-end/total
-        final cr = response.headers.value(HttpHeaders.contentRangeHeader);
-        final total = int.tryParse(cr?.split('/').last ?? '');
-        if (total != null) task.totalBytes = total;
-        task.receivedBytes = startByte;
-      } else {
-        final cl = response.headers.value(HttpHeaders.contentLengthHeader);
-        final parsed = cl == null ? null : int.tryParse(cl);
-        if (parsed != null && parsed > 0) task.totalBytes = parsed;
-        task.receivedBytes = 0;
-      }
-
-      sink = partFile.openWrite(mode: isResume ? FileMode.append : FileMode.write);
-      var lastEmitMs = DateTime.now().millisecondsSinceEpoch;
-      var lastEmitBytes = task.receivedBytes;
-
-      await for (final chunk in stream) {
-        sink.add(chunk);
-        task.receivedBytes += chunk.length;
-        final now = DateTime.now().millisecondsSinceEpoch;
-        if (now - lastEmitMs >= 500) {
-          final dt = (now - lastEmitMs) / 1000;
-          final instant = (task.receivedBytes - lastEmitBytes) / dt;
-          task.speedBps = task.speedBps == 0
-              ? instant
-              : task.speedBps * 0.6 + instant * 0.4; // EMA 平滑
-          lastEmitMs = now;
-          lastEmitBytes = task.receivedBytes;
-          _emit(task);
-        }
-      }
-      await sink.flush();
-      await sink.close();
-      sink = null;
-
-      // 完整性校验（需求 2.4）
-      if (task.expectedSha256 != null) {
-        task.status = DownloadStatus.verifying;
-        _emit(task);
-        final actual = await sha256OfFile(task.partPath);
-        if (actual != task.expectedSha256) {
-          await partFile.delete();
-          throw Exception('文件校验失败（SHA256 不匹配）');
-        }
-      }
-
-      // 校验通过 → 原子重命名，杜绝半成品被识别为有效模型
-      if (await File(task.savePath).exists()) {
-        await File(task.savePath).delete();
-      }
-      await partFile.rename(task.savePath);
-      task.status = DownloadStatus.completed;
-      task.completedAt = DateTime.now();
+    // 串行队列：已有任务在下载则置 queued 排队，由前序结束时自动启动
+    if (_active != null && _active != task) {
+      task.status = DownloadStatus.queued;
       _emit(task);
-    } on DioException catch (e) {
-      await _closeSink(sink);
-      if (CancelToken.isCancel(e)) {
-        task.status = DownloadStatus.paused; // 用户暂停/取消
-      } else {
+      if (!_queue.contains(task)) _queue.add(task);
+      return;
+    }
+    _active = task;
+    try {
+      await _runLoop(task);
+    } finally {
+      if (_active == task) {
+        _active = null;
+        _startNextQueued();
+      }
+    }
+  }
+
+  void _startNextQueued() {
+    while (_queue.isNotEmpty) {
+      final next = _queue.removeAt(0);
+      // 已取消或状态已变化的排队任务直接跳过
+      if (_tasks[next.id] != next || next.status != DownloadStatus.queued) {
+        continue;
+      }
+      unawaited(_run(next));
+      return;
+    }
+  }
+
+  Future<void> _runLoop(DownloadTask task) async {
+    final cancelToken = CancelToken();
+    task._cancelToken = cancelToken;
+
+    while (true) {
+      // 任务已被取消/移除时立即中止，防止已取消任务复活
+      if (_tasks[task.id] != task) return;
+
+      task.status = DownloadStatus.downloading;
+      task.error = null;
+      task.speedBps = 0;
+      _emit(task);
+
+      final partFile = File(task.partPath);
+      int startByte = 0;
+      if (await partFile.exists()) {
+        startByte = await partFile.length();
+      }
+
+      IOSink? sink;
+      try {
+        final response = await _dio.get<ResponseBody>(
+          task.url,
+          cancelToken: cancelToken,
+          options: Options(
+            responseType: ResponseType.stream,
+            headers: startByte > 0 ? {'Range': 'bytes=$startByte-'} : null,
+          ),
+        );
+
+        // 206 = 服务器接受续传；200 = 忽略 Range 需重写
+        final isResume = response.statusCode == 206;
+        final stream = response.data!.stream;
+
+        if (isResume) {
+          // content-range: bytes start-end/total
+          final cr = response.headers.value(HttpHeaders.contentRangeHeader);
+          final total = int.tryParse(cr?.split('/').last ?? '');
+          if (total != null) task.totalBytes = total;
+          task.receivedBytes = startByte;
+        } else {
+          final cl = response.headers.value(HttpHeaders.contentLengthHeader);
+          final parsed = cl == null ? null : int.tryParse(cl);
+          if (parsed != null && parsed > 0) task.totalBytes = parsed;
+          task.receivedBytes = 0;
+        }
+
+        // 写文件前确保目录存在
+        final dir = partFile.parent;
+        if (!await dir.exists()) await dir.create(recursive: true);
+
+        sink = partFile.openWrite(
+            mode: isResume ? FileMode.append : FileMode.write);
+        var lastEmitMs = DateTime.now().millisecondsSinceEpoch;
+        var lastEmitBytes = task.receivedBytes;
+
+        await for (final chunk in stream) {
+          sink.add(chunk);
+          task.receivedBytes += chunk.length;
+          final now = DateTime.now().millisecondsSinceEpoch;
+          if (now - lastEmitMs >= 500) {
+            final dt = (now - lastEmitMs) / 1000;
+            final instant = (task.receivedBytes - lastEmitBytes) / dt;
+            task.speedBps = task.speedBps == 0
+                ? instant
+                : task.speedBps * 0.6 + instant * 0.4; // EMA 平滑
+            lastEmitMs = now;
+            lastEmitBytes = task.receivedBytes;
+            _emit(task);
+          }
+        }
+        await sink.flush();
+        await sink.close();
+        sink = null;
+
+        // 完整性校验（需求 2.4）
+        if (task.expectedSha256 != null) {
+          task.status = DownloadStatus.verifying;
+          _emit(task);
+          final actual = await sha256OfFile(task.partPath);
+          // 校验耗时较长，期间任务可能已被取消（.part 已删除）
+          if (_tasks[task.id] != task) return;
+          if (actual != task.expectedSha256) {
+            try {
+              await partFile.delete();
+            } catch (_) {}
+            throw Exception('文件校验失败（SHA256 不匹配）');
+          }
+        }
+
+        // 原子重命名前确认任务未被取消，杜绝已取消任务复活
+        if (_tasks[task.id] != task) return;
+        // 校验通过 → 原子重命名，杜绝半成品被识别为有效模型
+        if (await File(task.savePath).exists()) {
+          await File(task.savePath).delete();
+        }
+        await partFile.rename(task.savePath);
+        task.status = DownloadStatus.completed;
+        task.completedAt = DateTime.now();
+        _emit(task);
+        return;
+      } on DioException catch (e) {
+        await _closeSink(sink);
+        if (CancelToken.isCancel(e)) {
+          // cancel() 已移除任务并清理 .part，直接返回避免复活
+          if (_tasks[task.id] != task) return;
+          task.status = DownloadStatus.paused; // 用户暂停
+          _emit(task);
+          return;
+        }
         task._retryCount += 1;
         if (task._retryCount <= 3) {
-          await Future.delayed(Duration(seconds: 2 * task._retryCount));
-          return _run(task); // 网络重试（续传）
+          // 重试等待期间响应暂停/取消，不再无条件递归
+          final cancelled = await _delayUnlessCancelled(
+              Duration(seconds: 2 * task._retryCount), cancelToken);
+          if (_tasks[task.id] != task) return; // 等待期间被取消
+          if (cancelled) {
+            task.status = DownloadStatus.paused; // 等待期间被暂停
+            _emit(task);
+            return;
+          }
+          continue; // 网络重试（续传）
         }
         task.status = DownloadStatus.failed;
         task.error = '下载失败: ${e.message ?? e.type.name}';
+        _emit(task);
+        return;
+      } catch (e) {
+        await _closeSink(sink);
+        // 校验期间被取消（.part 被删导致异常）不复活任务
+        if (_tasks[task.id] != task) return;
+        task.status = DownloadStatus.failed;
+        task.error = e.toString();
+        _emit(task);
+        return;
+      } finally {
+        _persist();
       }
-      _emit(task);
-    } catch (e) {
-      await _closeSink(sink);
-      task.status = DownloadStatus.failed;
-      task.error = e.toString();
-      _emit(task);
-    } finally {
-      _persist();
     }
+  }
+
+  /// 可被取消的延时：等待期间暂停/取消生效时提前返回 true
+  Future<bool> _delayUnlessCancelled(Duration duration, CancelToken token) {
+    final completer = Completer<bool>();
+    Timer? timer;
+    timer = Timer(duration, () {
+      timer = null;
+      if (!completer.isCompleted) completer.complete(false);
+    });
+    token.whenCancel.then((_) {
+      timer?.cancel();
+      if (!completer.isCompleted) completer.complete(true);
+    });
+    return completer.future;
   }
 
   void _emit(DownloadTask task) => _events.add(task);
