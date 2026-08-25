@@ -2,10 +2,12 @@
 import 'package:flutter/material.dart';
 import 'features/chat/chat_screen.dart';
 import 'features/settings/model_management_screen.dart';
+import 'features/settings/api_server_screen.dart';
 import 'core/services/conversation_service.dart';
 import 'core/services/model_service.dart';
 import 'core/services/download_manager.dart';
 import 'core/services/hf_api_service.dart';
+import 'core/services/api_server/api_server_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -17,6 +19,9 @@ void main() async {
   // 初始化会话服务：恢复历史会话、上次打开的会话，
   // 并注册模型切换监听（切模型 → 归档旧会话 + 开新会话）
   await ConversationService().init();
+
+  // 初始化 API 服务：恢复端口/API Key 配置，退出前开着则自动重启
+  await ApiServerService.instance.init();
 
   // 恢复下载任务记录（断点续传）
   await DownloadManager.instance.init();
@@ -66,6 +71,7 @@ class _HomePageState extends State<HomePage> {
   final List<Widget> _pages = [
     const ChatScreen(),
     const ModelManagementScreen(),
+    const ApiServerScreen(),
   ];
 
   @override
@@ -90,6 +96,10 @@ class _HomePageState extends State<HomePage> {
           NavigationDestination(
             icon: Icon(Icons.folder),
             label: '模型',
+          ),
+          NavigationDestination(
+            icon: Icon(Icons.dns),
+            label: 'API 服务',
           ),
         ],
       ),
