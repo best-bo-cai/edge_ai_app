@@ -1,5 +1,6 @@
 import 'dart:convert';
 import 'dart:io';
+import 'dart:isolate';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
@@ -56,7 +57,11 @@ class ModelInfo {
 }
 
 /// 模型管理服务
-class ModelService {
+///
+/// ChangeNotifier：当前选中模型/本地模型列表变化时广播事件——
+/// 管理页刷新高亮；对话页（IndexedStack 常驻 + const 页面切页不 rebuild）
+/// 依赖此事件热切换模型，而非 build 兜底检测。
+class ModelService extends ChangeNotifier {
   static final ModelService _instance = ModelService._internal();
   factory ModelService() => _instance;
   ModelService._internal();
@@ -175,8 +180,14 @@ class ModelService {
     required String url,
     required String modelName,
   }) async {
-    final fileName = url.split('?').first.split('/').last;
-    if (!fileName.toLowerCase().endsWith('.gguf')) {
+    var fileName = url.split('?').first.split('#').first.split('/').last;
+    // URL 解码（如 %20 → 空格）；失败则保留原样
+    try {
+      final decoded = Uri.decodeComponent(fileName);
+      // 解码后可能引入 '/'（%2F），替换掉防路径逃逸
+      fileName = decoded.replaceAll('/', '_');
+    } catch (_) {}
+    if (fileName.isEmpty || !fileName.toLowerCase().endsWith('.gguf')) {
       throw Exception('仅支持 .gguf 文件直链');
     }
     return DownloadManager.instance.start(
@@ -186,10 +197,11 @@ class ModelService {
     );
   }
 
-  /// 从外部导入模型文件
-  Future<void> importModel(String sourcePath) async {
+  /// 从外部导入模型文件（复制在独立 Isolate 执行，大文件不卡 UI）。
+  /// 返回 null 表示成功，否则返回需提示的信息（如重名改名）。
+  Future<String?> importModel(String sourcePath) async {
     final sourceFile = File(sourcePath);
-    
+
     if (!await sourceFile.exists()) {
       throw Exception('源文件不存在');
     }
@@ -201,7 +213,8 @@ class ModelService {
 
     final fileName = sourceFile.uri.pathSegments.last;
     String destPath = '${_modelsDir.path}/$fileName';
-    
+    String? notice;
+
     // 如果已存在，添加时间戳
     if (await File(destPath).exists()) {
       final timestamp = DateTime.now().millisecondsSinceEpoch;
@@ -209,12 +222,17 @@ class ModelService {
           fileName.substring(0, fileName.length - '.gguf'.length);
       final newFileName = '${baseName}_$timestamp.gguf';
       destPath = '${_modelsDir.path}/$newFileName';
+      notice = '已存在同名模型，导入为 $newFileName';
     }
-    
-    final destFile = File(destPath);
 
-    await sourceFile.copy(destFile.path);
+    final src = sourceFile.path;
+    final dst = destPath;
+    // 多 GB 模型复制走独立 Isolate（Isolate.run 会返回结果并自动传播异常）
+    await Isolate.run(() => File(src).copy(dst));
+
     await _scanLocalModels();
+    notifyListeners(); // 模型列表变化
+    return notice;
   }
 
   /// 删除模型
@@ -238,8 +256,9 @@ class ModelService {
         final prefs = await SharedPreferences.getInstance();
         await prefs.remove('current_model_id');
       }
-      
+
       await _scanLocalModels();
+      notifyListeners(); // 列表变化（可能含当前模型清空）
     }
   }
 
@@ -258,6 +277,7 @@ class ModelService {
 
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('current_model_id', modelId);
+    notifyListeners(); // 通知管理页刷新高亮、对话页热切换模型
   }
 
   /// 模型存储目录（main 中 init 后可用）
