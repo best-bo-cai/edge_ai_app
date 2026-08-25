@@ -3,14 +3,22 @@ import 'package:flutter/material.dart';
 import 'features/chat/chat_screen.dart';
 import 'features/settings/model_management_screen.dart';
 import 'core/services/model_service.dart';
+import 'core/services/download_manager.dart';
+import 'core/services/hf_api_service.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  
+
   // 初始化模型服务
   final modelService = ModelService();
   await modelService.init();
-  
+
+  // 恢复下载任务记录（断点续传）
+  await DownloadManager.instance.init();
+
+  // 恢复上次可用的 HF 数据源（官方源/镜像），使镜像状态全局共享（首屏提速）
+  await HfApiService.instance.restoreHost();
+
   runApp(const EdgeMindApp());
 }
 

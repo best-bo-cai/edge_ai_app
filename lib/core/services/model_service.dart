@@ -1,8 +1,13 @@
+import 'dart:convert';
 import 'dart:io';
-import 'package:dio/dio.dart';
+import 'dart:isolate';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart' show rootBundle;
 import 'package:path_provider/path_provider.dart';
-import 'package:permission_handler/permission_handler.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+
+import 'package:edge_ai_app/core/models/hf_catalog_models.dart';
+import 'package:edge_ai_app/core/services/download_manager.dart';
 
 /// 模型信息数据类
 class ModelInfo {
@@ -52,47 +57,56 @@ class ModelInfo {
 }
 
 /// 模型管理服务
-class ModelService {
+///
+/// ChangeNotifier：当前选中模型/本地模型列表变化时广播事件——
+/// 管理页刷新高亮；对话页（IndexedStack 常驻 + const 页面切页不 rebuild）
+/// 依赖此事件热切换模型，而非 build 兜底检测。
+class ModelService extends ChangeNotifier {
   static final ModelService _instance = ModelService._internal();
   factory ModelService() => _instance;
   ModelService._internal();
 
-  final Dio _dio = Dio();
   late Directory _modelsDir;
   List<ModelInfo> _availableModels = [];
   String? _currentModelId;
 
-  /// 推荐模型列表 (Qwen3.5 系列)
-  final List<Map<String, dynamic>> recommendedModels = [
-    {
-      'id': 'qwen3.5-0.8b-q4km',
-      'name': 'Qwen3.5-0.8B-Instruct (Q4_K_M)',
-      'url': 'https://huggingface.co/bartowski/Qwen3.5-0.8B-Instruct-GGUF/resolve/main/Qwen3.5-0.8B-Instruct-Q4_K_M.gguf',
-      'size': 620 * 1024 * 1024, // ~620MB
-      'description': '平衡性能与体积，推荐大多数设备使用',
-    },
-    {
-      'id': 'qwen3.5-0.8b-q5km',
-      'name': 'Qwen3.5-0.8B-Instruct (Q5_K_M)',
-      'url': 'https://huggingface.co/bartowski/Qwen3.5-0.8B-Instruct-GGUF/resolve/main/Qwen3.5-0.8B-Instruct-Q5_K_M.gguf',
-      'size': 720 * 1024 * 1024, // ~720MB
-      'description': '更高精度，适合高端设备',
-    },
-    {
-      'id': 'qwen3.5-0.8b-q6k',
-      'name': 'Qwen3.5-0.8B-Instruct (Q6_K)',
-      'url': 'https://huggingface.co/bartowski/Qwen3.5-0.8B-Instruct-GGUF/resolve/main/Qwen3.5-0.8B-Instruct-Q6_K.gguf',
-      'size': 850 * 1024 * 1024, // ~850MB
-      'description': '最高精度，仅推荐旗舰设备',
-    },
-    {
-      'id': 'qwen2.5-0.5b-q4km',
-      'name': 'Qwen2.5-0.5B-Instruct (Q4_K_M)',
-      'url': 'https://huggingface.co/bartowski/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/Qwen2.5-0.5B-Instruct-Q4_K_M.gguf',
-      'size': 320 * 1024 * 1024, // ~320MB
-      'description': '轻量级，适合低端设备或快速测试',
-    },
-  ];
+  static const String _fallbackAssetPath = 'assets/data/fallback_models.json';
+
+  /// 解析兜底清单 JSON（需求 3.1）
+  /// 逐条容错：单条坏数据仅跳过该条并记录日志，不影响其余条目
+  static List<HfModel> parseFallbackJson(String raw) {
+    Map<String, dynamic> data;
+    try {
+      data = jsonDecode(raw) as Map<String, dynamic>;
+    } catch (e) {
+      debugPrint('ModelService: 兜底清单 JSON 解析失败: $e');
+      return const [];
+    }
+    final models = data['models'];
+    if (models is! List) {
+      debugPrint('ModelService: 兜底清单缺少 models 数组，实际类型 ${models.runtimeType}');
+      return const [];
+    }
+    final result = <HfModel>[];
+    for (var i = 0; i < models.length; i++) {
+      try {
+        result.add(HfModel.fromJson(models[i] as Map<String, dynamic>));
+      } catch (e) {
+        debugPrint('ModelService: 兜底清单第 $i 条解析失败，已跳过: $e');
+      }
+    }
+    return result;
+  }
+
+  /// 网络异常时加载内置精选清单
+  Future<List<HfModel>> loadFallbackModels() async {
+    try {
+      return parseFallbackJson(await rootBundle.loadString(_fallbackAssetPath));
+    } catch (e) {
+      debugPrint('ModelService: 兜底清单资产加载失败($_fallbackAssetPath): $e');
+      return const [];
+    }
+  }
 
   /// 初始化服务
   Future<void> init() async {
@@ -116,19 +130,25 @@ class ModelService {
     return modelsDir;
   }
 
-  /// 扫描本地已下载的模型
+  /// 扫描本地已下载的模型。
+  /// I4: 递归扫描子目录（models/{author}/{fileName}），
+  /// 兼容平铺在 models 根目录的旧文件
   Future<void> _scanLocalModels() async {
-    _availableModels.clear();
-    
-    final entries = _modelsDir.listSync();
+    // M6: 先收集全部条目再一次性赋值，消除 await 期间暴露半成品列表的中间态
+    final models = <ModelInfo>[];
+
+    final entries = _modelsDir.listSync(recursive: true);
     for (final entry in entries) {
-      if (entry is File && entry.path.endsWith('.gguf')) {
+      // I1: 与 downloadModel 的大小写不敏感校验一致，防 .GGUF 下载后不可见
+      if (entry is File && entry.path.toLowerCase().endsWith('.gguf')) {
         final stat = await entry.stat();
         final fileName = entry.uri.pathSegments.last;
-        
-        _availableModels.add(ModelInfo(
-          id: fileName.replaceAll('.gguf', '').toLowerCase().replaceAll('_', '-'),
-          name: fileName.replaceAll('.gguf', ''),
+        final baseName =
+            fileName.substring(0, fileName.length - '.gguf'.length);
+
+        models.add(ModelInfo(
+          id: baseName.toLowerCase().replaceAll('_', '-'),
+          name: baseName,
           path: entry.path,
           sizeBytes: stat.size,
           isDownloaded: true,
@@ -136,6 +156,7 @@ class ModelService {
         ));
       }
     }
+    _availableModels = models;
   }
 
   /// 获取所有可用模型
@@ -154,74 +175,64 @@ class ModelService {
     return model.path;
   }
 
-  /// 下载模型 (带进度回调)
-  Future<void> downloadModel({
+  /// 自定义 URL 下载（统一走 DownloadManager，支持暂停/续传/校验）
+  Future<DownloadTask> downloadModel({
     required String url,
-    required String modelId,
     required String modelName,
-    Function(double progress)? onProgress,
   }) async {
-    // 请求存储权限 (仅 Android)
-    if (Platform.isAndroid) {
-      final status = await Permission.storage.status;
-      if (!status.isGranted) {
-        await Permission.storage.request();
-      }
+    var fileName = url.split('?').first.split('#').first.split('/').last;
+    // URL 解码（如 %20 → 空格）；失败则保留原样
+    try {
+      final decoded = Uri.decodeComponent(fileName);
+      // 解码后可能引入 '/'（%2F），替换掉防路径逃逸
+      fileName = decoded.replaceAll('/', '_');
+    } catch (_) {}
+    if (fileName.isEmpty || !fileName.toLowerCase().endsWith('.gguf')) {
+      throw Exception('仅支持 .gguf 文件直链');
     }
-
-    final fileName = '${modelId.replaceAll('-', '_')}.gguf';
-    final savePath = '${_modelsDir.path}/$fileName';
-    
-    // 检查是否已存在
-    final existingFile = File(savePath);
-    if (await existingFile.exists()) {
-      throw Exception('模型文件已存在');
-    }
-
-    await _dio.download(
-      url,
-      savePath,
-      onReceiveProgress: (received, total) {
-        if (total != -1) {
-          final progress = received / total;
-          if (onProgress != null) {
-            onProgress(progress);
-          }
-        }
-      },
+    return DownloadManager.instance.start(
+      url: url,
+      displayName: modelName,
+      savePath: '${_modelsDir.path}/$fileName',
     );
-
-    // 重新扫描本地模型
-    await _scanLocalModels();
   }
 
-  /// 从外部导入模型文件
-  Future<void> importModel(String sourcePath) async {
+  /// 从外部导入模型文件（复制在独立 Isolate 执行，大文件不卡 UI）。
+  /// 返回 null 表示成功，否则返回需提示的信息（如重名改名）。
+  Future<String?> importModel(String sourcePath) async {
     final sourceFile = File(sourcePath);
-    
+
     if (!await sourceFile.exists()) {
       throw Exception('源文件不存在');
     }
 
-    if (!sourcePath.endsWith('.gguf')) {
+    // I1: 与 downloadModel 的大小写不敏感校验一致，兼容 .GGUF 扩展名
+    if (!sourcePath.toLowerCase().endsWith('.gguf')) {
       throw Exception('仅支持 .gguf 格式的模型文件');
     }
 
     final fileName = sourceFile.uri.pathSegments.last;
     String destPath = '${_modelsDir.path}/$fileName';
-    
+    String? notice;
+
     // 如果已存在，添加时间戳
     if (await File(destPath).exists()) {
       final timestamp = DateTime.now().millisecondsSinceEpoch;
-      final baseName = fileName.replaceAll('.gguf', '');
+      final baseName =
+          fileName.substring(0, fileName.length - '.gguf'.length);
       final newFileName = '${baseName}_$timestamp.gguf';
       destPath = '${_modelsDir.path}/$newFileName';
+      notice = '已存在同名模型，导入为 $newFileName';
     }
-    
-    final destFile = File(destPath);
 
-    await sourceFile.copy(destFile.path);
+    final src = sourceFile.path;
+    final dst = destPath;
+    // 多 GB 模型复制走独立 Isolate（Isolate.run 会返回结果并自动传播异常）
+    await Isolate.run(() => File(src).copy(dst));
+
     await _scanLocalModels();
+    notifyListeners(); // 模型列表变化
+    return notice;
   }
 
   /// 删除模型
@@ -234,15 +245,20 @@ class ModelService {
     final file = File(model.path);
     if (await file.exists()) {
       await file.delete();
-      
+
+      // I1: 联动清除下载任务记录，避免详情页 completed 态
+      // 指向已删除的文件（渲染死锁）
+      await DownloadManager.instance.forget(model.path);
+
       // 如果删除的是当前模型，清空当前选择
       if (_currentModelId == modelId) {
         _currentModelId = null;
         final prefs = await SharedPreferences.getInstance();
         await prefs.remove('current_model_id');
       }
-      
+
       await _scanLocalModels();
+      notifyListeners(); // 列表变化（可能含当前模型清空）
     }
   }
 
@@ -258,14 +274,23 @@ class ModelService {
     }
 
     _currentModelId = modelId;
-    
+
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString('current_model_id', modelId);
+    notifyListeners(); // 通知管理页刷新高亮、对话页热切换模型
   }
 
-  /// 检查模型是否已下载
-  bool isModelDownloaded(String modelId) {
-    return _availableModels.any((m) => m.id == modelId && m.isDownloaded);
+  /// 模型存储目录（main 中 init 后可用）
+  String get modelsDirPath => _modelsDir.path;
+
+  /// 按文件路径加载运行（详情页"加载运行"入口）
+  Future<void> switchModelByPath(String path) async {
+    await _scanLocalModels();
+    final model = _availableModels.firstWhere(
+      (m) => m.path == path,
+      orElse: () => throw Exception('模型不存在'),
+    );
+    await switchModel(model.id);
   }
 
   /// 获取模型下载状态

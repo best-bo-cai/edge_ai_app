@@ -19,12 +19,16 @@ dependencies:
   dio: ^5.4.3+1
   # 文件选择 (外部导入)
   file_picker: ^8.0.7
-  # 权限处理 (安卓存储权限)
-  permission_handler: ^11.3.1
   # 本地存储 (记录默认模型)
   shared_preferences: ^2.2.3
   # 文件名处理
   path: ^1.9.0
+  # 设备信息 (CPU ABI)
+  device_info_plus: ^10.1.0
+  # SHA256 完整性校验
+  crypto: ^3.0.3
+  # 网络类型检测 (蜂窝网络下载提醒)
+  connectivity_plus: ^6.0.3
 
 dev_dependencies:
   flutter_test:
@@ -35,8 +39,8 @@ dev_dependencies:
 flutter:
   uses-material-design: true
   assets:
-    - assets/models/
     - assets/icons/
+    - assets/data/
 
 ffigen:
   name: LlamaFFI

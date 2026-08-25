@@ -1,39 +1,43 @@
 // native/dummy_llama.cpp
-// MVP 版本占位文件（当 llama.cpp 未克隆时使用）
-// 实际使用时请克隆 llama.cpp 并移除此文件
+// 兜底占位实现：当 third_party/llama.cpp 未克隆时保证工程可编译。
+// 此时 libllama.so 仅提供"加载即失败"的桩实现，App 侧自动降级为 Mock 对话。
 
-#include <stddef.h>
+#include "llama_wrapper.h"
 
-// 占位类型定义
-typedef int32_t llama_token;
-typedef struct llama_model llama_model;
-typedef struct llama_context llama_context;
-typedef struct llama_batch llama_batch;
+#include <string>
 
-// 占位函数实现
+static std::string g_dummy_error = "llama.cpp not available (dummy build)";
+
 extern "C" {
 
-void llama_backend_init(void) {}
-void llama_backend_free(void) {}
+void edge_llama_backend_init(void) {}
 
-llama_model* llama_load_model_from_file(const char*, void*) { return nullptr; }
-void llama_free_model(llama_model*) {}
-
-llama_context* llama_new_context_with_model(llama_model*, void*) { return nullptr; }
-void llama_free(llama_context*) {}
-
-llama_batch llama_batch_init(int, int, int) { return {}; }
-void llama_batch_free(llama_batch) {}
-
-int llama_decode(llama_context*, llama_batch) { return -1; }
-
-std::vector<llama_token> llama_tokenize(llama_context*, const std::string&, bool) { return {}; }
-llama_token llama_sampler_sample(void*, llama_context*, int) { return 0; }
-std::string llama_token_to_piece(llama_context*, llama_token) { return ""; }
-llama_token llama_token_eos(llama_model*) { return 0; }
-int llama_vocab_type(llama_model*) { return 0; }
-
-llama_model_params llama_model_default_params() { return {}; }
-llama_context_params llama_context_default_params() { return {}; }
-
+EdgeContext* edge_llama_load_model(const char*, int, int,
+                                   edge_llama_progress_callback, void*) {
+    return nullptr;
 }
+
+const char* edge_llama_model_desc(EdgeContext*) { return ""; }
+const char* edge_llama_chat_template(EdgeContext*) { return ""; }
+
+int edge_llama_start_context(EdgeContext*, int, int) { return -1; }
+
+int edge_llama_apply_chat_template(EdgeContext*, const char* const*, const char* const*,
+                                   int, int, char*, int) {
+    return -1;
+}
+
+int edge_llama_decode(EdgeContext*, const char*, int,
+                      edge_llama_token_callback, void*) {
+    return -1;
+}
+
+void edge_llama_abort(EdgeContext*) {}
+
+void edge_llama_free_piece(char*) {}
+
+void edge_llama_free_context(EdgeContext*) {}
+
+const char* edge_llama_get_last_error(void) { return g_dummy_error.c_str(); }
+
+} // extern "C"

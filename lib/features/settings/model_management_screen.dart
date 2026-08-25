@@ -1,8 +1,11 @@
-import 'dart:io';
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
+import 'package:edge_ai_app/core/services/chat_service.dart';
+import 'package:edge_ai_app/core/services/download_manager.dart';
 import '../../core/services/model_service.dart';
+import '../model_market/model_market_screen.dart';
 
 /// 模型管理页面 - 支持下载、导入、切换模型
 class ModelManagementScreen extends StatefulWidget {
@@ -15,90 +18,84 @@ class ModelManagementScreen extends StatefulWidget {
 class _ModelManagementScreenState extends State<ModelManagementScreen> {
   final ModelService _modelService = ModelService();
   final TextEditingController _urlController = TextEditingController();
-  
-  // 下载状态跟踪
-  String? _downloadingModelId;
-  double _downloadProgress = 0.0;
-  bool _isDownloading = false;
+
+  // 下载任务跟踪（DownloadManager 事件驱动 + 重启回填）
+  List<DownloadTask> _pendingTasks = const [];
+  StreamSubscription<DownloadTask>? _dlSub;
+  bool _isImporting = false;
+
+  bool get _isDownloading => _pendingTasks.any((t) =>
+      t.status == DownloadStatus.downloading ||
+      t.status == DownloadStatus.verifying ||
+      t.status == DownloadStatus.queued);
+
+  /// 未完成的下载任务（含排队/下载/暂停/校验/失败）
+  List<DownloadTask> _pendingTasksOf() =>
+      DownloadManager.instance.tasks
+          .where((t) => t.status != DownloadStatus.completed)
+          .toList();
 
   @override
   void initState() {
     super.initState();
     _refreshModels();
+    // 模型切换/导入/删除事件：刷新当前模型高亮与列表
+    // （switchModel 只改内存不触发本页 setState，须事件驱动）
+    _modelService.addListener(_onModelServiceChanged);
+    // I2: 杀进程重启后 DownloadManager.init() 恢复的任务记录无事件可监听，
+    // 须在此回填，否则自定义 URL 任务将失去"继续/取消"入口
+    _pendingTasks = _pendingTasksOf();
+    _dlSub = DownloadManager.instance.events.listen((t) {
+      if (!mounted) return;
+      setState(() => _pendingTasks = _pendingTasksOf());
+      // 下载完成后刷新已下载列表（管理页常驻 IndexedStack，需事件驱动刷新）
+      if (t.status == DownloadStatus.completed) {
+        _refreshModels();
+      }
+    });
   }
 
   Future<void> _refreshModels() async {
     await _modelService.init();
-    setState(() {});
+    if (mounted) setState(() {});
   }
 
-  /// 开始下载模型
-  Future<void> _startDownload(Map<String, dynamic> model) async {
-    if (_isDownloading) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('已有下载任务正在进行')),
-      );
-      return;
-    }
-
-    setState(() {
-      _downloadingModelId = model['id'];
-      _isDownloading = true;
-      _downloadProgress = 0.0;
-    });
-
-    try {
-      await _modelService.downloadModel(
-        url: model['url'],
-        modelId: model['id'],
-        modelName: model['name'],
-        onProgress: (progress) {
-          setState(() {
-            _downloadProgress = progress;
-          });
-        },
-      );
-
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('${model['name']} 下载完成')),
-        );
-        await _refreshModels();
-      }
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('下载失败：$e')),
-        );
-      }
-    } finally {
-      setState(() {
-        _downloadingModelId = null;
-        _isDownloading = false;
-        _downloadProgress = 0.0;
-      });
-    }
+  void _onModelServiceChanged() {
+    if (mounted) setState(() {});
   }
 
-  /// 从外部导入模型
+  /// 从外部导入模型。
+  /// 注意：Android 上 FileType.custom + .gguf（无 MIME 映射）会导致文件灰选，
+  /// 改用 FileType.any 让用户任选文件，选中后手动校验 .gguf 扩展名。
   Future<void> _importModel() async {
     try {
       FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['gguf'],
+        type: FileType.any,
+        withData: false,
       );
 
-      if (result != null && result.files.single.path != null) {
-        setState(() => _isDownloading = true);
-        
-        await _modelService.importModel(result.files.single.path!);
-        
+      final path = result?.files.single.path;
+      if (path == null) return; // 用户取消
+
+      if (!path.toLowerCase().endsWith('.gguf')) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('模型导入成功')),
+            const SnackBar(content: Text('仅支持 .gguf 格式的模型文件，请重新选择')),
           );
-          await _refreshModels();
         }
+        return;
+      }
+
+      setState(() => _isImporting = true);
+
+      // 大文件复制在独立 Isolate 执行，避免阻塞 UI
+      final imported = await _modelService.importModel(path);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(imported ?? '模型导入成功')),
+        );
+        await _refreshModels();
       }
     } catch (e) {
       if (mounted) {
@@ -107,7 +104,7 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
         );
       }
     } finally {
-      setState(() => _isDownloading = false);
+      if (mounted) setState(() => _isImporting = false);
     }
   }
 
@@ -128,9 +125,8 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
       return;
     }
 
-    // 从 URL 提取文件名作为模型 ID
+    // 从 URL 提取文件名作为展示名
     final fileName = p.basename(url.split('?').first);
-    final modelId = fileName.replaceAll('.gguf', '').toLowerCase().replaceAll('_', '-');
     final modelName = fileName.replaceAll('.gguf', '');
 
     if (_isDownloading) {
@@ -140,30 +136,13 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
       return;
     }
 
-    setState(() {
-      _downloadingModelId = modelId;
-      _isDownloading = true;
-      _downloadProgress = 0.0;
-    });
-
     try {
-      await _modelService.downloadModel(
-        url: url,
-        modelId: modelId,
-        modelName: modelName,
-        onProgress: (progress) {
-          setState(() {
-            _downloadProgress = progress;
-          });
-        },
-      );
-
+      await _modelService.downloadModel(url: url, modelName: modelName);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('$modelName 下载完成')),
+          const SnackBar(content: Text('开始下载，可离开此页面，下载将自动继续')),
         );
         _urlController.clear();
-        await _refreshModels();
       }
     } catch (e) {
       if (mounted) {
@@ -171,12 +150,6 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
           SnackBar(content: Text('下载失败：$e')),
         );
       }
-    } finally {
-      setState(() {
-        _downloadingModelId = null;
-        _isDownloading = false;
-        _downloadProgress = 0.0;
-      });
     }
   }
 
@@ -184,9 +157,11 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
   Future<void> _switchModel(String modelId) async {
     try {
       await _modelService.switchModel(modelId);
+      // 通知聊天服务失效缓存（切回对话页自动热加载新模型）
+      ChatService().invalidate();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('模型已切换，重启应用生效')),
+          const SnackBar(content: Text('模型已切换，前往对话页即可使用')),
         );
       }
     } catch (e) {
@@ -252,30 +227,38 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
+            // 模型广场入口（在线推荐 + 设备适配筛选）
+            Card(
+              child: ListTile(
+                leading: const Icon(Icons.storefront, color: Colors.blue),
+                title: const Text('模型广场'),
+                subtitle: const Text('浏览 HuggingFace 推荐模型，按本机配置智能筛选'),
+                trailing: const Icon(Icons.chevron_right),
+                onTap: () => Navigator.push(
+                  context,
+                  MaterialPageRoute(builder: (_) => const ModelMarketScreen()),
+                ),
+              ),
+            ),
+
+            const SizedBox(height: 24),
+
             // 自定义 URL 下载卡片
             _buildCustomDownloadCard(),
-            
+
             const SizedBox(height: 24),
-            
+
+            // I2: 下载任务区块（含杀进程重启后恢复的任务）
+            if (_pendingTasks.isNotEmpty) ...[
+              _buildDownloadTasksSection(),
+              const SizedBox(height: 24),
+            ],
+
             // 导入按钮
             _buildImportButton(),
-            
+
             const SizedBox(height: 24),
-            
-            // 推荐模型列表
-            if (_modelService.recommendedModels.isNotEmpty) ...[
-              const Text(
-                '推荐模型 (Qwen3.5 系列)',
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-              ),
-              const SizedBox(height: 12),
-              ..._modelService.recommendedModels.map((model) => 
-                _buildRecommendedModelCard(model),
-              ),
-            ],
-            
-            const SizedBox(height: 24),
-            
+
             // 已下载模型列表
             if (availableModels.isNotEmpty) ...[
               const Text(
@@ -330,37 +313,30 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
               ),
               enabled: !_isDownloading,
             ),
-            if (_downloadingModelId != null && _isDownloading) ...[
-              const SizedBox(height: 12),
-              LinearProgressIndicator(value: _downloadProgress),
-              const SizedBox(height: 4),
-              Text(
-                '下载中：${(_downloadProgress * 100).toStringAsFixed(1)}%',
-                style: const TextStyle(fontSize: 12),
-              ),
-            ],
+            // I2: 进度展示移至"下载任务"区块统一承载（覆盖全部任务来源）
           ],
         ),
       ),
     );
   }
 
-  Widget _buildImportButton() {
-    return Card(
-      child: ListTile(
-        leading: const Icon(Icons.folder_open),
-        title: const Text('从本地导入模型'),
-        subtitle: const Text('选择已下载的 .gguf 文件'),
-        trailing: const Icon(Icons.chevron_right),
-        onTap: _isDownloading ? null : _importModel,
-      ),
+  /// I2: 下载任务区块——渲染全部未完成任务（含重启恢复的），
+  /// 提供暂停/继续/取消/重试入口
+  Widget _buildDownloadTasksSection() {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Text(
+          '下载任务',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+        ),
+        const SizedBox(height: 12),
+        ..._pendingTasks.map(_buildDownloadTaskCard),
+      ],
     );
   }
 
-  Widget _buildRecommendedModelCard(Map<String, dynamic> model) {
-    final isDownloaded = _modelService.isModelDownloaded(model['id']);
-    final isDownloading = _downloadingModelId == model['id'];
-
+  Widget _buildDownloadTaskCard(DownloadTask task) {
     return Card(
       child: Padding(
         padding: const EdgeInsets.all(12),
@@ -370,55 +346,137 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
             Row(
               children: [
                 Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        model['name'],
-                        style: const TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        model['description'],
-                        style: const TextStyle(fontSize: 12, color: Colors.grey),
-                      ),
-                      const SizedBox(height: 4),
-                      Text(
-                        '大小：${_formatSize(model['size'])}',
-                        style: const TextStyle(fontSize: 12, color: Colors.blue),
-                      ),
-                    ],
+                  child: Text(
+                    task.displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: const TextStyle(
+                        fontSize: 15, fontWeight: FontWeight.bold),
                   ),
                 ),
-                if (isDownloading)
-                  SizedBox(
-                    width: 100,
-                    child: Column(
-                      children: [
-                        const CircularProgressIndicator(strokeWidth: 2),
-                        const SizedBox(height: 4),
-                        Text(
-                          '${(_downloadProgress * 100).toStringAsFixed(0)}%',
-                          style: const TextStyle(fontSize: 12),
-                        ),
-                      ],
-                    ),
-                  )
-                else if (isDownloaded)
-                  const Icon(Icons.check_circle, color: Colors.green)
-                else
-                  ElevatedButton.icon(
-                    onPressed: () => _startDownload(model),
-                    icon: const Icon(Icons.download),
-                    label: const Text('下载'),
-                  ),
+                _buildTaskActions(task),
               ],
             ),
+            const SizedBox(height: 8),
+            LinearProgressIndicator(
+              // 总大小未知（totalBytes = -1）时走不定进度动画
+              value: task.totalBytes > 0 ? task.progress : null,
+            ),
+            const SizedBox(height: 4),
+            Text(
+              _taskStatusLine(task),
+              style: const TextStyle(fontSize: 12, color: Colors.grey),
+            ),
+            if (task.status == DownloadStatus.failed &&
+                task.error != null) ...[
+              const SizedBox(height: 2),
+              Text(
+                task.error!,
+                style: const TextStyle(fontSize: 11, color: Colors.red),
+              ),
+            ],
           ],
         ),
+      ),
+    );
+  }
+
+  /// 按状态渲染操作按钮：downloading → 暂停；paused → 继续+取消；
+  /// queued → 取消排队；failed → 重试；verifying 无操作
+  Widget _buildTaskActions(DownloadTask task) {
+    switch (task.status) {
+      case DownloadStatus.downloading:
+        return IconButton(
+          tooltip: '暂停',
+          icon: const Icon(Icons.pause),
+          onPressed: () => DownloadManager.instance.pause(task.id),
+        );
+      case DownloadStatus.paused:
+        return Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            TextButton(
+              onPressed: () => DownloadManager.instance.resume(task.id),
+              child: const Text('继续'),
+            ),
+            IconButton(
+              tooltip: '取消并删除',
+              icon: const Icon(Icons.close, color: Colors.red),
+              onPressed: () => DownloadManager.instance.cancel(task.id),
+            ),
+          ],
+        );
+      case DownloadStatus.queued:
+        return IconButton(
+          tooltip: '取消排队',
+          icon: const Icon(Icons.close, color: Colors.red),
+          onPressed: () => DownloadManager.instance.cancel(task.id),
+        );
+      case DownloadStatus.failed:
+        return TextButton(
+          onPressed: () => DownloadManager.instance.resume(task.id),
+          child: const Text('重试'),
+        );
+      case DownloadStatus.verifying:
+      case DownloadStatus.completed:
+        return const SizedBox.shrink();
+    }
+  }
+
+  String _taskStatusLine(DownloadTask task) {
+    final buffer = StringBuffer(_statusLabelOf(task.status));
+    if (task.totalBytes > 0) {
+      buffer.write(' · ${(task.progress * 100).toStringAsFixed(1)}%');
+    } else if (task.receivedBytes > 0) {
+      buffer.write(' · 已下载 ${_fmtBytes(task.receivedBytes)}');
+    }
+    if (task.status == DownloadStatus.downloading && task.speedBps > 0) {
+      buffer.write(' · ${_fmtSpeed(task.speedBps)}');
+    }
+    return buffer.toString();
+  }
+
+  String _statusLabelOf(DownloadStatus status) {
+    switch (status) {
+      case DownloadStatus.queued:
+        return '排队中';
+      case DownloadStatus.downloading:
+        return '下载中';
+      case DownloadStatus.paused:
+        return '已暂停';
+      case DownloadStatus.verifying:
+        return '校验中';
+      case DownloadStatus.completed:
+        return '已完成';
+      case DownloadStatus.failed:
+        return '失败';
+    }
+  }
+
+  String _fmtBytes(int bytes) {
+    if (bytes >= 1024 * 1024 * 1024) {
+      return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+    }
+    if (bytes >= 1024 * 1024) {
+      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
+    }
+    return '${(bytes / 1024).toStringAsFixed(1)} KB';
+  }
+
+  String _fmtSpeed(double bps) {
+    if (bps < 1024) return '${bps.toStringAsFixed(0)} B/s';
+    if (bps < 1024 * 1024) return '${(bps / 1024).toStringAsFixed(0)} KB/s';
+    return '${(bps / 1024 / 1024).toStringAsFixed(1)} MB/s';
+  }
+
+  Widget _buildImportButton() {
+    return Card(
+      child: ListTile(
+        leading: const Icon(Icons.folder_open),
+        title: const Text('从本地导入模型'),
+        subtitle: const Text('选择已下载的 .gguf 文件'),
+        trailing: const Icon(Icons.chevron_right),
+        onTap: (_isDownloading || _isImporting) ? null : _importModel,
       ),
     );
   }
@@ -479,16 +537,6 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
     );
   }
 
-  String _formatSize(int bytes) {
-    if (bytes < 1024 * 1024) {
-      return '${(bytes / 1024).toStringAsFixed(1)} KB';
-    } else if (bytes < 1024 * 1024 * 1024) {
-      return '${(bytes / (1024 * 1024)).toStringAsFixed(1)} MB';
-    } else {
-      return '${(bytes / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
-    }
-  }
-
   String _formatDate(DateTime date) {
     return '${date.year}-${date.month.toString().padLeft(2, '0')}-${date.day.toString().padLeft(2, '0')} '
         '${date.hour.toString().padLeft(2, '0')}:${date.minute.toString().padLeft(2, '0')}';
@@ -496,6 +544,8 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
 
   @override
   void dispose() {
+    _modelService.removeListener(_onModelServiceChanged);
+    _dlSub?.cancel();
     _urlController.dispose();
     super.dispose();
   }

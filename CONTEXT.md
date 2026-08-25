@@ -1,0 +1,33 @@
+# 词汇表（ ubiquitous language ）
+
+本文件只放领域术语定义，不放实现细节。
+
+## 会话（Conversation）
+
+一次持续的多轮对话，拥有独立的消息时间线、创建时间与标题。用户可新建、切换、重命名、删除会话。App 内同一时刻只有一个「当前会话」。
+
+## 消息（Message）
+
+会话内的一条发言，角色为 user / assistant / system。流式生成中的 assistant 消息处于「生成中」状态，生成结束后固化。
+
+## 模型（Model）
+
+一个已下载或导入的 GGUF 模型文件，具有 id、名称、路径、量化等级等属性。同一时刻引擎最多加载一个模型。
+
+## 会话绑定模型（Conversation-Model Binding）
+
+每个会话在创建时绑定一个模型。在旧会话中继续发消息时，引擎自动热切换回该会话绑定的模型。
+
+## 模型参数（Model Parameters）
+
+每个模型独有的一套推理参数，分两类：
+- 采样参数：temperature、top_k、top_p、repeat_penalty、max_tokens——每次生成即时生效
+- 上下文参数：n_ctx、n_threads——改动后需重载模型生效
+
+## API 服务（API Service）
+
+内嵌于 App、监听 127.0.0.1 的本地 HTTP 服务，向手机上其他 app 提供 OpenAI / Anthropic 兼容接口。由用户手动开关，开启时以 Android 前台服务保活。
+
+## API 调用日志（API Call Log）
+
+外部 API 请求的流水记录（时间、端点、token 数、请求与响应内容）。API 请求不产生会话，只记入调用日志，在独立的日志列表页查看。
