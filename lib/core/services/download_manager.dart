@@ -76,6 +76,9 @@ class DownloadManager {
   DownloadManager({Dio? dio})
       : _dio = dio ??
             Dio(BaseOptions(
+              // 连接超时：死链/被墙域名 30s 内失败，及时进入重试/暂停流程
+              connectTimeout: const Duration(seconds: 30),
+              // 收包间超时：慢速大文件下载不被误杀
               receiveTimeout: const Duration(minutes: 1),
               maxRedirects: 5,
             ));
