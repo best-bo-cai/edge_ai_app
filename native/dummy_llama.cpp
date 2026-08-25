@@ -20,7 +20,7 @@ EdgeContext* edge_llama_load_model(const char*, int, int,
 const char* edge_llama_model_desc(EdgeContext*) { return ""; }
 const char* edge_llama_chat_template(EdgeContext*) { return ""; }
 
-int edge_llama_start_context(EdgeContext*, int, int) { return -1; }
+int edge_llama_start_context(EdgeContext*, int, int, int) { return -1; }
 
 int edge_llama_apply_chat_template(EdgeContext*, const char* const*, const char* const*,
                                    int, int, char*, int) {
@@ -28,6 +28,7 @@ int edge_llama_apply_chat_template(EdgeContext*, const char* const*, const char*
 }
 
 int edge_llama_decode(EdgeContext*, const char*, int,
+                      float, float, float, float,
                       edge_llama_token_callback, void*) {
     return -1;
 }
