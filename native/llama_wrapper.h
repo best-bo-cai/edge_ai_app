@@ -67,9 +67,10 @@ const char* edge_llama_chat_template(EdgeContext* ectx);
  * @param ectx edge_llama_load_model 返回的句柄
  * @param n_ctx 上下文窗口大小（token 数）
  * @param n_batch 批处理大小
+ * @param n_threads CPU 推理线程数（0 = llama.cpp 默认全部核心）
  * @return 0 成功，非 0 失败
  */
-int edge_llama_start_context(EdgeContext* ectx, int n_ctx, int n_batch);
+int edge_llama_start_context(EdgeContext* ectx, int n_ctx, int n_batch, int n_threads);
 
 /**
  * 按模型内置模板格式化对话消息
@@ -94,10 +95,14 @@ int edge_llama_apply_chat_template(
 
 /**
  * 执行一次流式推理（阻塞直至生成结束/中止/达到 max_tokens）。
- * 采样参数使用默认值：top_k=40, top_p=0.9, temp=0.7, repeat_penalty=1.1。
+ * 采样参数由调用方传入（模型参数配置，需求文档 §4）；<=0 时使用内置默认值。
  * 每个生成出的文本片段通过 callback 流式回调。
  * @param prompt 已格式化的完整提示词
  * @param max_tokens 最大生成 token 数
+ * @param top_k top-k 采样（<=0 用默认 40）
+ * @param top_p top-p 采样（<=0 用默认 0.9）
+ * @param temp 温度（<=0 用默认 0.7）
+ * @param repeat_penalty 重复惩罚（<=0 用默认 1.1）
  * @param callback Token 回调（可为 NULL）
  * @param user_data 回调透传数据
  * @return 0 成功；1 被用户中止；负数失败
@@ -106,6 +111,10 @@ int edge_llama_decode(
     EdgeContext* ectx,
     const char* prompt,
     int max_tokens,
+    float top_k,
+    float top_p,
+    float temp,
+    float repeat_penalty,
     edge_llama_token_callback callback,
     void* user_data
 );

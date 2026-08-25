@@ -2,6 +2,7 @@
 import 'package:flutter/material.dart';
 import 'features/chat/chat_screen.dart';
 import 'features/settings/model_management_screen.dart';
+import 'core/services/conversation_service.dart';
 import 'core/services/model_service.dart';
 import 'core/services/download_manager.dart';
 import 'core/services/hf_api_service.dart';
@@ -12,6 +13,10 @@ void main() async {
   // 初始化模型服务
   final modelService = ModelService();
   await modelService.init();
+
+  // 初始化会话服务：恢复历史会话、上次打开的会话，
+  // 并注册模型切换监听（切模型 → 归档旧会话 + 开新会话）
+  await ConversationService().init();
 
   // 恢复下载任务记录（断点续传）
   await DownloadManager.instance.init();

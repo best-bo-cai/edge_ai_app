@@ -142,7 +142,7 @@ const char* edge_llama_chat_template(EdgeContext* ectx) {
     return ectx != nullptr ? ectx->chat_template.c_str() : "";
 }
 
-int edge_llama_start_context(EdgeContext* ectx, int n_ctx, int n_batch) {
+int edge_llama_start_context(EdgeContext* ectx, int n_ctx, int n_batch, int n_threads) {
     if (ectx == nullptr || ectx->model == nullptr) {
         set_error("invalid context: model not loaded");
         return -1;
@@ -155,7 +155,11 @@ int edge_llama_start_context(EdgeContext* ectx, int n_ctx, int n_batch) {
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = (uint32_t)n_ctx;
     cparams.n_batch = (uint32_t)n_batch;
-    // 线程数：由 llama.cpp 默认值（全部核心）决定；如需限制在调用方配置
+    // 线程数：>0 用配置值；0 = llama.cpp 默认（全部核心）
+    if (n_threads > 0) {
+        cparams.n_threads = (int32_t)n_threads;
+        cparams.n_threads_batch = (int32_t)n_threads;
+    }
     // abort 回调：CPU 计算期间轮询，支持跨线程中止长计算
     cparams.abort_callback = edge_abort_cb;
     cparams.abort_callback_data = ectx;
@@ -210,6 +214,10 @@ int edge_llama_decode(
         EdgeContext* ectx,
         const char* prompt,
         int max_tokens,
+        float top_k,
+        float top_p,
+        float temp,
+        float repeat_penalty,
         edge_llama_token_callback callback,
         void* user_data) {
     if (ectx == nullptr || ectx->ctx == nullptr) {
@@ -270,14 +278,21 @@ int edge_llama_decode(
         }
     }
 
-    // 4. 采样链（默认参数）
+    // 4. 采样链（参数由调用方传入；<=0 时回退内置默认值）
+    const float use_top_k = top_k > 0 ? top_k : (float)kDefaultTopK;
+    const float use_top_p = top_p > 0 ? top_p : kDefaultTopP;
+    const float use_temp = temp > 0 ? temp : kDefaultTemp;
+    const float use_penalty = repeat_penalty > 0 ? repeat_penalty : kDefaultRepeatPenalty;
+    LOGI("sample params: top_k=%.1f top_p=%.2f temp=%.2f penalty=%.2f",
+         use_top_k, use_top_p, use_temp, use_penalty);
+
     llama_sampler_chain_params sparams = llama_sampler_chain_default_params();
     llama_sampler* smpl = llama_sampler_chain_init(sparams);
     llama_sampler_chain_add(smpl, llama_sampler_init_penalties(
-            llama_vocab_n_tokens(vocab), 64, kDefaultRepeatPenalty, 0.0f, 0.0f));
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_k(kDefaultTopK));
-    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(kDefaultTopP, 1));
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(kDefaultTemp));
+            llama_vocab_n_tokens(vocab), 64, use_penalty, 0.0f, 0.0f));
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_k((int32_t)use_top_k));
+    llama_sampler_chain_add(smpl, llama_sampler_init_top_p(use_top_p, 1));
+    llama_sampler_chain_add(smpl, llama_sampler_init_temp(use_temp));
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(0));
 
     // 5. 自回归生成

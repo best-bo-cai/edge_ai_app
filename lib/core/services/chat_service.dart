@@ -3,14 +3,20 @@ import 'dart:async';
 
 import '../engine/llama_engine.dart';
 import '../models/message.dart';
+import '../models/model_params.dart';
+import 'conversation_service.dart';
+import 'model_params_service.dart';
 import 'model_service.dart';
 
-/// 聊天服务：管理对话历史与推理调度
+/// 聊天服务：管理当前会话的消息时间线与推理调度
 ///
-/// 模型加载策略：
-/// - ensureLoaded() 对比 ModelService 当前选中模型与引擎已加载路径，
-///   不一致时自动热切换（卸载旧模型 → 加载新模型 → 清空历史）
-/// - 无选中模型但本地已有模型时，自动选第一个
+/// 模型加载策略（一期升级）：
+/// - 目标模型 = 当前会话绑定的模型（会话切换/新建时由
+///   ConversationService 同步到 ModelService，此处只读）
+/// - 加载签名 = (模型路径, nCtx, nThreads)：参数配置改动 → 签名变化 → 自动重载
+/// - 采样参数与 system prompt 每次生成从 ModelParamsService 读取（即时生效）
+/// - 消息持久化经 ConversationService 落库（user 发送即写，
+///   assistant 生成结束整体写）
 class ChatService {
   static final ChatService _instance = ChatService._internal();
   factory ChatService() => _instance;
@@ -18,13 +24,14 @@ class ChatService {
 
   final LlamaEngine _engine = LlamaEngine.instance;
   final ModelService _modelService = ModelService();
+  final ModelParamsService _paramsService = ModelParamsService();
+  final ConversationService _conversationService = ConversationService();
 
+  /// UI 侧内存中的当前时间线（含流式占位消息；持久化由 ConversationService 负责）
   final List<ChatMessage> _messageHistory = [];
 
   /// 参与构建提示词的最大历史轮数（防止超出上下文窗口）
   static const int _maxHistoryMessages = 20;
-
-  static const String _systemPrompt = 'You are a helpful AI assistant. Respond in Chinese.';
 
   bool _isGenerating = false;
 
@@ -36,51 +43,93 @@ class ChatService {
   /// 模型加载进度（0.0~1.0），仅加载期间有事件（供 UI 显示进度条）
   Stream<double> get loadProgress => _engine.loadProgress;
 
-  /// 引擎当前加载的模型路径是否与 ModelService 选中的模型一致
-  bool get isModelSynced {
-    final current = _modelService.currentModelPath;
-    return current != null && current == _engine.loadedPath;
+  /// 当前会话绑定的模型 id（无会话时回退 ModelService 选中值）
+  String? get targetModelId {
+    final convModel = _conversationService.currentConversation?.modelId;
+    if (convModel != null && _modelService.getModelInfo(convModel) != null) {
+      return convModel;
+    }
+    return _modelService.currentModelId;
   }
 
-  /// 确保当前选中的模型已加载（幂等；模型变化时自动热切换）。
+  /// 引擎当前加载的模型路径是否与目标模型一致
+  bool get isModelSynced {
+    final id = targetModelId;
+    if (id == null) return false;
+    final info = _modelService.getModelInfo(id);
+    return info != null && info.path == _engine.loadedPath;
+  }
+
+  /// 确保当前会话绑定的模型已加载（幂等；模型或上下文参数变化时自动热切换）。
   /// 返回 null 表示就绪；否则返回错误信息。
   Future<String?> ensureLoaded() async {
     try {
       final initialized = await _engine.initialize();
       if (!initialized || _engine.isMock) return null; // Mock 模式始终"就绪"
 
-      // 无选中模型但有本地模型 → 自动选第一个
-      if (_modelService.currentModelId == null) {
-        final models = _modelService.availableModels;
-        if (models.isEmpty) return null;
-        await _modelService.switchModel(models.first.id);
+      final targetId = targetModelId;
+      if (targetId == null) {
+        // 无会话/无选中模型但有本地模型 → 自动选第一个（触发会话创建链路）
+        if (_modelService.currentModelId == null &&
+            _modelService.availableModels.isNotEmpty) {
+          await _modelService.switchModel(_modelService.availableModels.first.id);
+        }
+        final id2 = targetModelId;
+        if (id2 == null) return null;
+        return await _loadModelFor(id2);
       }
-
-      final targetPath = _modelService.currentModelPath;
-      if (targetPath == null) return '未找到已下载的模型';
-
-      if (_engine.isLoaded && _engine.loadedPath == targetPath) {
-        return null; // 已加载且一致
-      }
-
-      // 热切换：卸载旧模型 + 清空历史
-      _messageHistory.clear();
-      await _engine.unload();
-
-      final result = await _engine.loadModel(modelPath: targetPath);
-      if (!result.ok) {
-        return '模型加载失败：${result.error.isEmpty ? "未知错误" : result.error}';
-      }
-      return null;
+      return await _loadModelFor(targetId);
     } catch (e) {
       // 引擎层异常兜底：转为错误信息，避免 UI 卡在 loading 态
       return '模型加载异常：$e';
     }
   }
 
+  Future<String?> _loadModelFor(String modelId) async {
+    final info = _modelService.getModelInfo(modelId);
+    if (info == null) return '会话绑定的模型已被删除，请重新选择模型';
+    final params = await _paramsService.getParams(modelId);
+
+    // 签名一致（路径 + nCtx/nThreads）→ 已就绪
+    if (_engine.isLoaded &&
+        _engine.loadedPath == info.path &&
+        _signatureOf(info.path, params) == _lastSignature) {
+      return null;
+    }
+
+    // 热切换：卸载旧模型（时间线由会话层持有，此处不清空）
+    await _engine.unload();
+    _lastSignature = _signatureOf(info.path, params);
+
+    final result = await _engine.loadModel(
+      modelPath: info.path,
+      nCtx: params.nCtx,
+      nThreads: params.nThreads,
+    );
+    if (!result.ok) {
+      _lastSignature = null;
+      return '模型加载失败：${result.error.isEmpty ? "未知错误" : result.error}';
+    }
+    return null;
+  }
+
+  /// 加载签名：上下文参数参与判断（参数配置改动 → 强制重载，需求文档 §4.2）
+  (String, int, int)? _lastSignature;
+  (String, int, int) _signatureOf(String path, ModelParams params) =>
+      (path, params.nCtx, params.nThreads);
+
   /// 模型被删除/切换后失效当前引擎状态（下一次 ensureLoaded 触发重载）
   void invalidate() {
     _messageHistory.clear();
+    _lastSignature = null;
+  }
+
+  /// 会话切换后同步内存时间线（丢弃流式中间态，直接用持久化数据）
+  void syncTimelineFromConversation() {
+    _messageHistory
+      ..clear()
+      ..addAll(_conversationService.currentMessages);
+    _lastSignature = null; // 目标模型可能变化，确保 ensureLoaded 重新校验
   }
 
   /// 发送消息并获取流式回复
@@ -90,30 +139,61 @@ class ChatService {
     }
     _isGenerating = true;
 
+    // 捕获本次生成所属会话：生成中用户切换会话时，消息仍写回原会话
+    final conversationId = _conversationService.currentConversation?.id;
+
     try {
-      // 确保模型就绪（快速路径：已加载时为 no-op）
+      // 确保模型就绪（快速路径：已加载且签名一致时为 no-op）
       final loadError = await ensureLoaded();
       if (loadError != null) {
         throw Exception(loadError);
       }
 
+      if (conversationId == null) {
+        throw Exception('当前无会话');
+      }
+
+      // user 消息：落库 + 上屏（需求文档 §2.2：发送时即落库）
+      await _conversationService.appendUserMessage(userMessage,
+          conversationId: conversationId);
       _messageHistory.add(ChatMessage.user(userMessage));
       _messageHistory.add(ChatMessage.assistant('', isStreaming: true));
 
+      final params = _paramsService.paramsOf(targetModelId ?? '');
+
       try {
-        // 构建含历史的完整提示词（原生模型模板优先，ChatML 兜底）
-        yield* _streamWithHistoryUpdate(_engine.generate(_buildPrompt()));
+        yield* _streamWithHistoryUpdate(_engine.generate(
+          _buildPrompt(params.systemPrompt),
+          maxTokens: params.maxTokens,
+          topK: params.topK.toDouble(),
+          topP: params.topP,
+          temperature: params.temperature,
+          repeatPenalty: params.repeatPenalty,
+        ));
       } on Exception catch (e) {
         // 上下文溢出：丢弃最旧一半历史后重试一次
         if (e.toString().contains('context window')) {
           _trimHistory(halve: true);
-          yield* _streamWithHistoryUpdate(_engine.generate(_buildPrompt()));
+          yield* _streamWithHistoryUpdate(_engine.generate(
+            _buildPrompt(params.systemPrompt),
+            maxTokens: params.maxTokens,
+            topK: params.topK.toDouble(),
+            topP: params.topP,
+            temperature: params.temperature,
+            repeatPenalty: params.repeatPenalty,
+          ));
         } else {
           rethrow;
         }
       }
     } finally {
       _finalizeStreamingMessage();
+      // assistant 消息整体落库（含中止时的部分内容，需求文档 §2.2）
+      final last = _messageHistory.isEmpty ? null : _messageHistory.last;
+      if (last != null && last.role == MessageRole.assistant && last.content.isNotEmpty) {
+        await _conversationService.appendAssistantMessage(last.content,
+            conversationId: conversationId);
+      }
       _isGenerating = false;
     }
   }
@@ -150,12 +230,13 @@ class ChatService {
     }
   }
 
-  /// 构建提示词：真实引擎走模型自带 ChatML/Jinja 模板，Mock/失败时 ChatML 兜底
-  String _buildPrompt() {
+  /// 构建提示词：真实引擎走模型自带 ChatML/Jinja 模板，Mock/失败时 ChatML 兜底。
+  /// system prompt 来自每模型配置（需求文档 §4.1）
+  String _buildPrompt(String systemPrompt) {
     final window = _messageWindow();
 
     final native = _engine.applyChatTemplate([
-      const TemplateMessage('system', _systemPrompt),
+      TemplateMessage('system', systemPrompt),
       ...window.map((m) => TemplateMessage(m.role.name, m.content)),
     ]);
     if (native != null && native.isNotEmpty) return native;
@@ -163,7 +244,7 @@ class ChatService {
     // ChatML 兜底（覆盖 Qwen/DeepSeek 等 ChatML 系模型）
     final buffer = StringBuffer();
     buffer.writeln('<|im_start|>system');
-    buffer.writeln(_systemPrompt);
+    buffer.writeln(systemPrompt);
     buffer.writeln('<|im_end|>');
     for (final msg in window) {
       buffer.writeln('<|im_start|>${msg.role.name}');
@@ -194,7 +275,7 @@ class ChatService {
     }
   }
 
-  /// 清除对话历史
+  /// 清除当前会话时间线（新会话/切换会话时由 UI 调用 syncTimeline 代替）
   void clearHistory() {
     _messageHistory.clear();
   }

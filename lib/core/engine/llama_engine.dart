@@ -26,19 +26,29 @@ typedef _LoadModelDart = Pointer<Void> Function(
     Pointer<Utf8> path, int gpuLayers, int useMmap,
     Pointer<NativeFunction<_ProgressCallbackC>> progressCb, Pointer<Void> progressData);
 
-typedef _StartContextC = Int32 Function(Pointer<Void> ectx, Int32 nCtx, Int32 nBatch);
-typedef _StartContextDart = int Function(Pointer<Void> ectx, int nCtx, int nBatch);
+typedef _StartContextC = Int32 Function(
+    Pointer<Void> ectx, Int32 nCtx, Int32 nBatch, Int32 nThreads);
+typedef _StartContextDart = int Function(
+    Pointer<Void> ectx, int nCtx, int nBatch, int nThreads);
 
 typedef _DecodeC = Int32 Function(
     Pointer<Void> ectx,
     Pointer<Utf8> prompt,
     Int32 maxTokens,
+    Float topK,
+    Float topP,
+    Float temp,
+    Float repeatPenalty,
     Pointer<NativeFunction<Void Function(Pointer<Utf8> piece, Pointer<Void> userData)>> callback,
     Pointer<Void> userData);
 typedef _DecodeDart = int Function(
     Pointer<Void> ectx,
     Pointer<Utf8> prompt,
     int maxTokens,
+    double topK,
+    double topP,
+    double temp,
+    double repeatPenalty,
     Pointer<NativeFunction<Void Function(Pointer<Utf8> piece, Pointer<Void> userData)>> callback,
     Pointer<Void> userData);
 
@@ -115,6 +125,10 @@ class LlamaEngine {
   int _ectxAddress = 0; // EdgeContext 指针地址（供 abort/模板调用）
   String _loadedPath = '';
   String _modelDesc = '';
+
+  /// 当前加载所用的上下文签名（nCtx, nThreads）。
+  /// 同路径但签名不同（参数配置改动）时 loadModel 强制重载。
+  (int, int) _signature = (0, 0);
 
   Isolate? _worker;
   SendPort? _workerPort;
@@ -231,12 +245,15 @@ class LlamaEngine {
 
   // ---------- 加载 / 卸载 ----------
 
-  /// 加载模型（在工作 Isolate 中执行）。重复加载同一路径为幂等 no-op。
+  /// 加载模型（在工作 Isolate 中执行）。
+  /// 同一路径且上下文签名（nCtx/nThreads）一致时为幂等 no-op；
+  /// 签名变化（参数配置改动）时强制重载。
   Future<LoadModelResult> loadModel({
     required String modelPath,
     int nCtx = 2048,
     int nBatch = 512,
     int nGpuLayers = 0,
+    int nThreads = 0,
     bool useMmap = true,
   }) async {
     await initialize();
@@ -245,7 +262,7 @@ class LlamaEngine {
       _modelDesc = 'Mock Engine';
       return const LoadModelResult(ok: true, desc: 'Mock Engine');
     }
-    if (isLoaded && _loadedPath == modelPath) {
+    if (isLoaded && _loadedPath == modelPath && _signature == (nCtx, nThreads)) {
       return LoadModelResult(ok: true, desc: _modelDesc);
     }
 
@@ -261,11 +278,13 @@ class LlamaEngine {
       'nCtx': nCtx,
       'nBatch': nBatch,
       'nGpuLayers': nGpuLayers,
+      'nThreads': nThreads,
       'useMmap': useMmap,
     });
     final r = await reply.future;
     if (r['ok'] == true) {
       _loadedPath = modelPath;
+      _signature = (nCtx, nThreads);
       _modelDesc = r['desc'] as String? ?? '';
       _ectxAddress = r['ectx'] as int;
     }
@@ -288,13 +307,22 @@ class LlamaEngine {
     _ectxAddress = 0;
     _loadedPath = '';
     _modelDesc = '';
+    _signature = (0, 0);
     _workerPort?.send({'cmd': 'free', 'ectx': ectx});
   }
 
   // ---------- 推理 ----------
 
   /// 流式生成。prompt 为按模型模板格式化后的完整提示词。
-  Stream<String> generate(String prompt, {int maxTokens = 512}) {
+  /// 采样参数（模型参数配置）随每次生成传入，即时生效。
+  Stream<String> generate(
+    String prompt, {
+    int maxTokens = 512,
+    double topK = 0,
+    double topP = 0,
+    double temperature = 0,
+    double repeatPenalty = 0,
+  }) {
     if (_genController != null && !_genController!.isClosed) {
       throw StateError('已有推理正在进行');
     }
@@ -328,6 +356,10 @@ class LlamaEngine {
       'ectx': ectx,
       'prompt': prompt,
       'maxTokens': maxTokens,
+      'topK': topK,
+      'topP': topP,
+      'temp': temperature,
+      'repeatPenalty': repeatPenalty,
       'callbackPtr': callbackPtr,
     });
 
@@ -496,7 +528,8 @@ class LlamaEngine {
             mainPort.send({'type': 'loadResult', 'id': reqId, 'ok': false, 'error': errP.toDartString()});
             continue;
           }
-          final rc = startContextFn(ectx, msg['nCtx'] as int, msg['nBatch'] as int);
+          final rc = startContextFn(
+              ectx, msg['nCtx'] as int, msg['nBatch'] as int, msg['nThreads'] as int? ?? 0);
           if (rc != 0) {
             final errP = getLastErrorFn();
             mainPort.send({'type': 'loadResult', 'id': reqId, 'ok': false, 'error': errP.toDartString()});
@@ -519,7 +552,16 @@ class LlamaEngine {
           final promptP = (msg['prompt'] as String).toNativeUtf8();
           final callbackPtr = Pointer<NativeFunction<_TokenCallbackC>>.fromAddress(
               msg['callbackPtr'] as int);
-          final result = decodeFn(ectx, promptP, msg['maxTokens'] as int, callbackPtr, nullptr);
+          final result = decodeFn(
+              ectx,
+              promptP,
+              msg['maxTokens'] as int,
+              (msg['topK'] as num?)?.toDouble() ?? 0,
+              (msg['topP'] as num?)?.toDouble() ?? 0,
+              (msg['temp'] as num?)?.toDouble() ?? 0,
+              (msg['repeatPenalty'] as num?)?.toDouble() ?? 0,
+              callbackPtr,
+              nullptr);
           calloc.free(promptP);
           if (result < 0) {
             final errP = getLastErrorFn();
