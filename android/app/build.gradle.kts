@@ -28,6 +28,19 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+
+        // llama.cpp 推理仅支持 arm64 真机
+        ndk {
+            abiFilters += listOf("arm64-v8a")
+        }
+    }
+
+    // llama.cpp 原生桥接库（native/CMakeLists.txt → libllama.so）
+    externalNativeBuild {
+        cmake {
+            path = file("../../native/CMakeLists.txt")
+            version = "3.22.1"
+        }
     }
 
     buildTypes {
@@ -35,6 +48,19 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+
+            externalNativeBuild {
+                cmake {
+                    arguments += listOf("-DCMAKE_BUILD_TYPE=Release")
+                }
+            }
+        }
+        debug {
+            externalNativeBuild {
+                cmake {
+                    arguments += listOf("-DCMAKE_BUILD_TYPE=RelWithDebInfo")
+                }
+            }
         }
     }
 }
