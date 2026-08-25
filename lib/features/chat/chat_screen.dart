@@ -1,10 +1,14 @@
 // lib/features/chat/chat_screen.dart
 import 'package:flutter/material.dart';
 import '../../core/services/chat_service.dart';
+import '../../core/services/conversation_service.dart';
 import '../../core/models/message.dart';
+import '../../core/services/model_params_service.dart';
 import '../../core/services/model_service.dart';
+import '../settings/model_params_screen.dart';
+import 'conversation_list_screen.dart';
 
-/// 聊天界面：llama.cpp 本地离线推理（流式输出）
+/// 聊天界面：llama.cpp 本地离线推理（流式输出）+ 多会话（一期）
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key});
 
@@ -14,7 +18,9 @@ class ChatScreen extends StatefulWidget {
 
 class _ChatScreenState extends State<ChatScreen> {
   final ChatService _chatService = ChatService();
+  final ConversationService _conversationService = ConversationService();
   final ModelService _modelService = ModelService();
+  final ModelParamsService _paramsService = ModelParamsService();
   final TextEditingController _inputController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
 
@@ -26,16 +32,23 @@ class _ChatScreenState extends State<ChatScreen> {
   /// 模型加载进度（null = 无进度数据；加载中 0.0~1.0）
   double? _loadProgress;
 
-  /// 生成期间收到模型切换事件时挂起重载，生成结束后执行
+  /// 生成期间收到模型切换/参数变更事件时挂起重载，生成结束后执行
   bool _pendingReload = false;
 
   @override
   void initState() {
     super.initState();
+    // 冷启动：会话已在 main() 中恢复，但此时本页 listener 尚未注册，
+    // 须主动同步一次时间线（否则历史消息不显示）
+    _chatService.syncTimelineFromConversation();
     _ensureModelLoaded();
     // 模型切换/导入/删除事件驱动热重载。IndexedStack 常驻 + const 页面
     // 在切页时不 rebuild，build 里的 _maybeReload 兜底不可靠，须事件驱动
     _modelService.addListener(_onModelChanged);
+    // 会话切换（列表页点开旧会话/新建/删除）→ 时间线同步 + 目标模型校验
+    _conversationService.addListener(_onConversationChanged);
+    // 参数配置变更（n_ctx/n_threads）→ 签名变化触发按需重载
+    _paramsService.addListener(_onParamsChanged);
     // 加载进度（0~1）驱动进度条；非加载期间无事件，不干扰 UI
     _chatService.loadProgress.listen((p) {
       if (mounted && _engineState == 'loading') {
@@ -53,8 +66,36 @@ class _ChatScreenState extends State<ChatScreen> {
     _ensureModelLoaded();
   }
 
-  /// 加载当前选中模型（幂等；模型变化时自动热切换）
+  /// 会话切换：同步内存时间线，确保新会话绑定的模型被加载。
+  /// 生成中切换会话（列表页操作）：不打断生成也不清流式时间线，
+  /// 挂起到生成结束后再同步（生成内容仍写回原会话，由 ChatService 保证）
+  void _onConversationChanged() {
+    if (!mounted) return;
+    if (_chatService.isGenerating) {
+      _pendingReload = true;
+      return;
+    }
+    _chatService.syncTimelineFromConversation();
+    setState(() {}); // 时间线立即刷新
+    _ensureModelLoaded();
+  }
+
+  /// 参数配置变更：上下文参数（n_ctx/n_threads）签名变化时引擎自动重载
+  void _onParamsChanged() {
+    if (!mounted) return;
+    if (_chatService.isGenerating) {
+      _pendingReload = true;
+      return;
+    }
+    _ensureModelLoaded();
+  }
+
+  /// 加载当前会话绑定的模型（幂等；模型/上下文参数变化时自动热切换）
   Future<void> _ensureModelLoaded() async {
+    if (_conversationService.currentModelMissing) {
+      setState(() => _engineState = 'idle');
+      return;
+    }
     if (_modelService.availableModels.isEmpty) {
       setState(() => _engineState = 'idle');
       return;
@@ -102,6 +143,21 @@ class _ChatScreenState extends State<ChatScreen> {
     final text = _inputController.text.trim();
     if (text.isEmpty || _chatService.isGenerating) return;
 
+    // 会话绑定模型已删除 → 引导选择替代模型（决策 2 边界场景）
+    if (_conversationService.currentModelMissing) {
+      await _promptRebindModel();
+      return;
+    }
+    // 无当前会话（首启）→ 自动创建
+    if (_conversationService.currentConversation == null) {
+      final modelId = _modelService.currentModelId ??
+          (_modelService.availableModels.isNotEmpty
+              ? _modelService.availableModels.first.id
+              : null);
+      if (modelId == null) return;
+      await _conversationService.createConversation(modelId: modelId);
+    }
+
     _inputController.clear();
 
     try {
@@ -116,19 +172,45 @@ class _ChatScreenState extends State<ChatScreen> {
       if (mounted) {
         setState(() {
           _engineState = 'error';
-          _engineError = e.toString();
+          _engineError = e.toString().replaceFirst('Exception: ', '');
         });
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('发送失败：$e')),
-        );
       }
     } finally {
       if (mounted) setState(() {});
-      // 生成期间收到模型切换事件 → 此刻生成已结束，补执行挂起的热重载
+      // 生成期间收到模型切换/会话切换/参数变更事件 → 此刻生成已结束，
+      // 补同步时间线与热重载
       if (_pendingReload && mounted && !_chatService.isGenerating) {
         _pendingReload = false;
+        _chatService.syncTimelineFromConversation();
+        setState(() {});
         _ensureModelLoaded();
       }
+    }
+  }
+
+  /// 模型缺失时弹窗选择替代模型并重绑当前会话
+  Future<void> _promptRebindModel() async {
+    final models = _modelService.availableModels;
+    if (models.isEmpty) {
+      setState(() => _engineState = 'idle');
+      return;
+    }
+    final selected = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('模型已删除'),
+        content: const Text('当前会话绑定的模型已被删除，请选择替代模型继续对话：'),
+        actions: models
+            .map((m) => TextButton(
+                  onPressed: () => Navigator.pop(ctx, m.id),
+                  child: Text(m.name, style: const TextStyle(fontSize: 13)),
+                ))
+            .toList(),
+      ),
+    );
+    if (selected != null && mounted) {
+      await _conversationService.rebindConversation(
+          _conversationService.currentConversation!.id, selected);
     }
   }
 
@@ -146,22 +228,54 @@ class _ChatScreenState extends State<ChatScreen> {
     }
   }
 
-  void _clearHistory() {
-    _chatService.clearHistory();
-    setState(() {});
+  void _openConversationList() {
+    Navigator.of(context).push(
+      MaterialPageRoute(builder: (_) => const ConversationListScreen()),
+    );
+  }
+
+  /// 模型参数配置页（当前会话绑定模型的参数；保存后采样参数即时生效，
+  /// n_ctx/n_threads 变化经 ModelParamsService 广播自动重载）
+  void _openModelParams() {
+    final modelId = _chatService.targetModelId ?? _modelService.currentModelId;
+    if (modelId == null) return;
+    final info = _modelService.getModelInfo(modelId);
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => ModelParamsScreen(
+          modelId: modelId,
+          modelName: info?.name ?? modelId,
+        ),
+      ),
+    );
+  }
+
+  Future<void> _newConversation() async {
+    final modelId = _modelService.currentModelId ??
+        (_modelService.availableModels.isNotEmpty
+            ? _modelService.availableModels.first.id
+            : null);
+    if (modelId == null) return;
+    await _conversationService.createConversation(modelId: modelId);
   }
 
   @override
   Widget build(BuildContext context) {
     _maybeReload();
     final noModel = _modelService.availableModels.isEmpty;
+    final modelMissing = _conversationService.currentModelMissing;
 
     return Scaffold(
       appBar: AppBar(
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('LocalChat', style: TextStyle(fontSize: 18)),
+            Text(
+              _conversationService.currentConversation?.title ?? 'LocalChat',
+              style: const TextStyle(fontSize: 18),
+              maxLines: 1,
+              overflow: TextOverflow.ellipsis,
+            ),
             Text(
               _statusLine(),
               style: const TextStyle(fontSize: 11, fontWeight: FontWeight.normal),
@@ -170,17 +284,37 @@ class _ChatScreenState extends State<ChatScreen> {
         ),
         actions: [
           IconButton(
-            icon: const Icon(Icons.delete_outline),
-            onPressed: _chatService.messageHistory.isNotEmpty ? _clearHistory : null,
-            tooltip: '清除对话',
+            icon: const Icon(Icons.tune),
+            onPressed: noModel ? null : _openModelParams,
+            tooltip: '模型参数',
+          ),
+          IconButton(
+            icon: const Icon(Icons.add_comment_outlined),
+            onPressed: noModel ? null : _newConversation,
+            tooltip: '新建会话',
           ),
         ],
+        leading: IconButton(
+          icon: const Icon(Icons.history),
+          onPressed: _openConversationList,
+          tooltip: '历史会话',
+        ),
       ),
       body: Column(
         children: [
           // 引擎状态提示条
           if (_engineState == 'loading')
             _buildLoadingBanner()
+          else if (modelMissing)
+            _buildStateBanner(
+              icon: Icons.warning_amber_rounded,
+              color: Colors.orange,
+              text: '会话绑定的模型已被删除',
+              action: TextButton(
+                onPressed: _promptRebindModel,
+                child: const Text('选择替代模型'),
+              ),
+            )
           else if (_engineState == 'error')
             _buildStateBanner(
               icon: Icons.error_outline,
@@ -189,7 +323,7 @@ class _ChatScreenState extends State<ChatScreen> {
               action: TextButton(onPressed: _ensureModelLoaded, child: const Text('重试')),
             ),
 
-          if (noModel)
+          if (noModel || modelMissing)
             Expanded(child: _buildNoModelWarning())
           else
             Expanded(child: _buildMessageList()),
@@ -209,7 +343,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }
 
   String? _currentModelName() {
-    final id = _modelService.currentModelId;
+    final id = _chatService.targetModelId ?? _modelService.currentModelId;
     if (id != null) {
       final info = _modelService.getModelInfo(id);
       if (info != null) return info.name;
@@ -297,6 +431,7 @@ class _ChatScreenState extends State<ChatScreen> {
 
   /// 构建无模型警告
   Widget _buildNoModelWarning() {
+    final modelMissing = _conversationService.currentModelMissing;
     return Center(
       child: Padding(
         padding: const EdgeInsets.all(32),
@@ -304,20 +439,22 @@ class _ChatScreenState extends State<ChatScreen> {
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
             Icon(
-              Icons.cloud_download_outlined,
+              modelMissing ? Icons.warning_amber_rounded : Icons.cloud_download_outlined,
               size: 80,
-              color: Colors.orange[400],
+              color: modelMissing ? Colors.orange[400] : Colors.orange[400],
             ),
             const SizedBox(height: 24),
-            const Text(
-              '暂无可用模型',
-              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
+            Text(
+              modelMissing ? '会话绑定的模型已删除' : '暂无可用模型',
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
             ),
             const SizedBox(height: 12),
-            const Text(
-              '请切换到底部"模型"标签页\n下载或导入 GGUF 模型后开始离线对话',
+            Text(
+              modelMissing
+                  ? '点击上方「选择替代模型」继续对话'
+                  : '请切换到底部"模型"标签页\n下载或导入 GGUF 模型后开始离线对话',
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 14, color: Colors.grey),
+              style: const TextStyle(fontSize: 14, color: Colors.grey),
             ),
           ],
         ),
@@ -496,6 +633,8 @@ class _ChatScreenState extends State<ChatScreen> {
   @override
   void dispose() {
     _modelService.removeListener(_onModelChanged);
+    _conversationService.removeListener(_onConversationChanged);
+    _paramsService.removeListener(_onParamsChanged);
     _inputController.dispose();
     _scrollController.dispose();
     super.dispose();
