@@ -35,6 +35,10 @@ class ChatService {
 
   bool _isGenerating = false;
 
+  /// 推理互斥锁：App 内对话（sendMessage）与 API 服务推理共用，
+  /// 保证任一时刻只有一个生成任务占用引擎（二期需求 §5.4）
+  Future<void> _engineGate = Future.value();
+
   List<ChatMessage> get messageHistory => List.unmodifiable(_messageHistory);
   bool get isGenerating => _isGenerating;
   String get loadedModelDesc => _engine.modelDesc;
@@ -142,6 +146,10 @@ class ChatService {
     // 捕获本次生成所属会话：生成中用户切换会话时，消息仍写回原会话
     final conversationId = _conversationService.currentConversation?.id;
 
+    // 占用引擎锁直到本次生成结束（与 API 服务推理互斥）
+    final gate = _acquireEngineGate();
+    await gate.wait();
+
     try {
       // 确保模型就绪（快速路径：已加载且签名一致时为 no-op）
       final loadError = await ensureLoaded();
@@ -195,8 +203,80 @@ class ChatService {
             conversationId: conversationId);
       }
       _isGenerating = false;
+      gate.release();
     }
   }
+
+  /// 引擎互斥锁：链式 Future——新任务排队在前序任务之后
+  _GateTicket _acquireEngineGate() {
+    final previous = _engineGate;
+    final completer = Completer<void>();
+    _engineGate = completer.future;
+    return _GateTicket(previous, completer);
+  }
+
+  /// API 推理通道（二期）：无会话副作用的流式生成。
+  /// - 独立于 App 内时间线（不写 _messageHistory / 不落库）
+  /// - 由 InferenceScheduler 持锁调用，与 sendMessage 互斥
+  Stream<String> generateRaw(
+    String prompt, {
+    required String modelId,
+    int? maxTokens,
+    double? topK,
+    double? topP,
+    double? temperature,
+    double? repeatPenalty,
+  }) async* {
+    // 占用引擎锁直到本次生成结束（与 sendMessage / 其他 API 请求互斥）。
+    // async* 生成器：锁在流被订阅时获取，流结束/取消时在 finally 释放
+    final gate = _acquireEngineGate();
+    await gate.wait();
+
+    try {
+      // 确保目标模型已按其配置加载（签名一致时 no-op）
+      final loadError = await _loadModelFor(modelId);
+      if (loadError != null) {
+        throw Exception(loadError);
+      }
+
+      final params = _paramsService.paramsOf(modelId);
+      yield* _engine.generate(
+        prompt,
+        maxTokens: maxTokens ?? params.maxTokens,
+        topK: topK ?? params.topK.toDouble(),
+        topP: topP ?? params.topP,
+        temperature: temperature ?? params.temperature,
+        repeatPenalty: repeatPenalty ?? params.repeatPenalty,
+      );
+    } finally {
+      gate.release();
+    }
+  }
+
+  /// API 推理通道：用引擎 chat template 渲染任意消息序列（API 请求的
+  /// messages 数组），返回完整提示词。模板缺失时 ChatML 兜底。
+  String buildApiPrompt(String systemPrompt, List<ChatMessage> messages) {
+    final native = _engine.applyChatTemplate([
+      TemplateMessage('system', systemPrompt),
+      ...messages.map((m) => TemplateMessage(m.role.name, m.content)),
+    ]);
+    if (native != null && native.isNotEmpty) return native;
+
+    final buffer = StringBuffer();
+    buffer.writeln('<|im_start|>system');
+    buffer.writeln(systemPrompt);
+    buffer.writeln('<|im_end|>');
+    for (final msg in messages) {
+      buffer.writeln('<|im_start|>${msg.role.name}');
+      buffer.writeln(msg.content);
+      buffer.writeln('<|im_end|>');
+    }
+    buffer.write('<|im_start|>assistant\n');
+    return buffer.toString();
+  }
+
+  /// 粗略 token 估算（API 响应 usage 字段用；无精确分词器时 ~4 字符/token）
+  int estimateTokens(String text) => (text.length / 4).ceil();
 
   /// 中止当前生成（保留已生成的部分内容）
   void stopGeneration() {
@@ -285,4 +365,17 @@ class ChatService {
     await _engine.dispose();
     _messageHistory.clear();
   }
+}
+
+/// 引擎锁票据：await previous 排队，release() 放行下一个任务
+class _GateTicket {
+  final Future<void> _previous;
+  final Completer<void> _completer;
+  _GateTicket(this._previous, this._completer);
+
+  /// 等待排到自己（含超时保护，避免死等）
+  Future<void> wait({Duration timeout = const Duration(seconds: 120)}) =>
+      _previous.timeout(timeout);
+
+  void release() => _completer.complete();
 }
