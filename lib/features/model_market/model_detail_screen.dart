@@ -3,6 +3,7 @@ import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/material.dart';
 
 import '../../core/device/device_capability_service.dart';
+import '../../core/services/chat_service.dart';
 import '../../core/models/compatibility.dart';
 import '../../core/models/hf_catalog_models.dart';
 import '../../core/services/download_manager.dart';
@@ -135,9 +136,11 @@ class _ModelDetailScreenState extends State<ModelDetailScreen> {
   Future<void> _onRunModel(String savePath) async {
     try {
       await _modelService.switchModelByPath(savePath);
+      // 通知聊天服务失效缓存（切回对话页自动热加载新模型）
+      ChatService().invalidate();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('模型已设为默认，重启应用后生效')),
+          const SnackBar(content: Text('模型已设为默认，前往对话页即可使用')),
         );
       }
     } catch (e) {

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:path/path.dart' as p;
+import 'package:edge_ai_app/core/services/chat_service.dart';
 import 'package:edge_ai_app/core/services/download_manager.dart';
 import '../../core/services/model_service.dart';
 import '../model_market/model_market_screen.dart';
@@ -38,6 +39,9 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
   void initState() {
     super.initState();
     _refreshModels();
+    // 模型切换/导入/删除事件：刷新当前模型高亮与列表
+    // （switchModel 只改内存不触发本页 setState，须事件驱动）
+    _modelService.addListener(_onModelServiceChanged);
     // I2: 杀进程重启后 DownloadManager.init() 恢复的任务记录无事件可监听，
     // 须在此回填，否则自定义 URL 任务将失去"继续/取消"入口
     _pendingTasks = _pendingTasksOf();
@@ -56,25 +60,42 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
     if (mounted) setState(() {});
   }
 
-  /// 从外部导入模型
+  void _onModelServiceChanged() {
+    if (mounted) setState(() {});
+  }
+
+  /// 从外部导入模型。
+  /// 注意：Android 上 FileType.custom + .gguf（无 MIME 映射）会导致文件灰选，
+  /// 改用 FileType.any 让用户任选文件，选中后手动校验 .gguf 扩展名。
   Future<void> _importModel() async {
     try {
       FilePickerResult? result = await FilePicker.platform.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: ['gguf'],
+        type: FileType.any,
+        withData: false,
       );
 
-      if (result != null && result.files.single.path != null) {
-        setState(() => _isImporting = true);
+      final path = result?.files.single.path;
+      if (path == null) return; // 用户取消
 
-        await _modelService.importModel(result.files.single.path!);
-
+      if (!path.toLowerCase().endsWith('.gguf')) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('模型导入成功')),
+            const SnackBar(content: Text('仅支持 .gguf 格式的模型文件，请重新选择')),
           );
-          await _refreshModels();
         }
+        return;
+      }
+
+      setState(() => _isImporting = true);
+
+      // 大文件复制在独立 Isolate 执行，避免阻塞 UI
+      final imported = await _modelService.importModel(path);
+
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(imported ?? '模型导入成功')),
+        );
+        await _refreshModels();
       }
     } catch (e) {
       if (mounted) {
@@ -136,9 +157,11 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
   Future<void> _switchModel(String modelId) async {
     try {
       await _modelService.switchModel(modelId);
+      // 通知聊天服务失效缓存（切回对话页自动热加载新模型）
+      ChatService().invalidate();
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('模型已切换，重启应用生效')),
+          const SnackBar(content: Text('模型已切换，前往对话页即可使用')),
         );
       }
     } catch (e) {
@@ -521,6 +544,7 @@ class _ModelManagementScreenState extends State<ModelManagementScreen> {
 
   @override
   void dispose() {
+    _modelService.removeListener(_onModelServiceChanged);
     _dlSub?.cancel();
     _urlController.dispose();
     super.dispose();
