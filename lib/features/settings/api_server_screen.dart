@@ -1,14 +1,19 @@
 // lib/features/settings/api_server_screen.dart
-// API 服务开关页（二期需求 §5.5）：
-// - 服务启停开关（持久化：退出前开着则下次启动自动恢复）
-// - 端口配置（运行中锁定，需停止后修改）
+// API 服务开关页（二期 §5.5 + 三期 §2.3/§3.2/§4）：
+// - 服务启停开关（持久化：退出前开着则下次启动自动恢复；开启时前台服务保活）
+// - 端口配置（49152~65535，运行中锁定；存量端口越界自动迁移 + 一次性提示）
 // - API Key 管理：展示/重新生成/自定义
-// - 接入信息：base_url + 两协议端点示例（供其他 App 配置）
+// - 接入信息：多 IP 列表（WiFi 优先，蜂窝标注不可达）+ 复制；网络变化自动刷新
+// - 保活引导卡片：电池优化检测/一键设置 + 厂商自启动文字指引（可不再提示）
 // - 调用统计：总调用/失败数（明细见 api_call_logs）
+import 'package:device_info_plus/device_info_plus.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/services/api_server/api_server_service.dart';
+import '../../core/services/keepalive/keepalive_service.dart';
 
 class ApiServerScreen extends StatefulWidget {
   const ApiServerScreen({super.key});
@@ -17,25 +22,73 @@ class ApiServerScreen extends StatefulWidget {
   State<ApiServerScreen> createState() => _ApiServerScreenState();
 }
 
-class _ApiServerScreenState extends State<ApiServerScreen> {
+class _ApiServerScreenState extends State<ApiServerScreen>
+    with WidgetsBindingObserver {
   final ApiServerService _service = ApiServerService.instance;
   late final TextEditingController _portController;
   late final TextEditingController _keyController;
 
+  // 引导卡片状态（三期 §4.1）
+  static const String _prefHideGuide = 'api_server_hide_keepalive_guide';
+  bool _hideGuide = false;
+  bool _ignoringBattery = true;
+  bool _notificationsEnabled = true;
+  String _manufacturer = '';
+
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this); // 回前台时重查 IP 与引导状态
     _portController = TextEditingController(text: _service.port.toString());
     _keyController = TextEditingController(text: _service.apiKey);
     _service.addListener(_onChanged);
+    _loadGuideState();
   }
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _service.removeListener(_onChanged);
     _portController.dispose();
     _keyController.dispose();
     super.dispose();
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      // 回前台：重查接入地址（网络可能已变化）与电池优化状态（用户可能刚从
+      // 系统设置页返回）
+      _service.refreshAddresses();
+      _refreshKeepAliveState();
+    }
+  }
+
+  Future<void> _loadGuideState() async {
+    final prefs = await SharedPreferences.getInstance();
+    if (!mounted) return;
+    setState(() {
+      _hideGuide = prefs.getBool(_prefHideGuide) ?? false;
+    });
+    await _refreshKeepAliveState();
+  }
+
+  Future<void> _refreshKeepAliveState() async {
+    final ignoring = await KeepAliveService.isIgnoringBatteryOptimizations();
+    final notif = await KeepAliveService.areNotificationsEnabled();
+    String manufacturer = '';
+    try {
+      if (defaultTargetPlatform == TargetPlatform.android) {
+        final info = await DeviceInfoPlugin().androidInfo;
+        manufacturer = info.manufacturer;
+      }
+    } catch (_) {}
+    if (!mounted) return;
+    setState(() {
+      _ignoringBattery = ignoring;
+      _notificationsEnabled = notif;
+      _manufacturer = manufacturer;
+    });
   }
 
   void _onChanged() {
@@ -66,10 +119,13 @@ class _ApiServerScreenState extends State<ApiServerScreen> {
 
   Future<void> _applyPort() async {
     final port = int.tryParse(_portController.text.trim());
-    if (port == null || port < 1024 || port > 65535) {
+    if (port == null || port < ApiServerService.minPort || port > ApiServerService.maxPort) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('端口需在 1024~65535 之间')),
+          const SnackBar(
+            content: Text(
+                '端口需在 ${ApiServerService.minPort}~${ApiServerService.maxPort} 之间'),
+          ),
         );
       }
       return;
@@ -108,22 +164,94 @@ class _ApiServerScreenState extends State<ApiServerScreen> {
     }
   }
 
+  Future<void> _requestBatteryOptimization() async {
+    await KeepAliveService.requestIgnoreBatteryOptimizations();
+    // 用户从系统设置页返回时 didChangeAppLifecycleState 会重查状态
+  }
+
+  Future<void> _hideGuideForever() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool(_prefHideGuide, true);
+    if (mounted) {
+      setState(() => _hideGuide = true);
+    }
+  }
+
+  void _copy(String text, String label) {
+    Clipboard.setData(ClipboardData(text: text));
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已复制$label')),
+    );
+  }
+
+  /// 厂商自启动设置路径（三期 §4.1：各厂商无标准入口，仅文字指引）
+  String get _autostartHint {
+    final m = _manufacturer.toLowerCase();
+    if (m.contains('xiaomi') || m.contains('redmi')) {
+      return '设置 → 应用设置 → 应用管理 → edge_ai_app → 自启动';
+    }
+    if (m.contains('huawei') || m.contains('honor')) {
+      return '设置 → 应用 → 应用启动管理 → edge_ai_app → 允许自启动';
+    }
+    if (m.contains('oppo') || m.contains('realme') || m.contains('oneplus')) {
+      return '设置 → 应用管理 → edge_ai_app → 允许自启动';
+    }
+    if (m.contains('vivo') || m.contains('iqoo')) {
+      return '设置 → 电池 → 后台高耗电 → edge_aiapp 允许后台运行';
+    }
+    return '在系统设置的电池/应用管理中允许 edge_aiapp 自启动与后台运行';
+  }
+
   @override
   Widget build(BuildContext context) {
     final running = _service.isRunning;
     final theme = Theme.of(context);
+    final addresses = _service.addresses;
+    final guideVisible =
+        running && !_hideGuide && (!_ignoringBattery || !_notificationsEnabled);
 
     return Scaffold(
       appBar: AppBar(title: const Text('API 服务')),
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
+          // 存量端口迁移一次性提示（三期 §3.3）
+          if (_service.portMigrated)
+            Material(
+              color: theme.colorScheme.tertiaryContainer,
+              borderRadius: BorderRadius.circular(8),
+              child: Padding(
+                padding: const EdgeInsets.all(12),
+                child: Row(
+                  children: [
+                    Icon(Icons.info_outline,
+                        size: 18, color: theme.colorScheme.tertiary),
+                    const SizedBox(width: 8),
+                    Expanded(
+                      child: Text(
+                        '端口策略已调整（${ApiServerService.minPort}~${ApiServerService.maxPort}），'
+                        '原端口已自动迁移为 ${ApiServerService.defaultPort}',
+                        style: theme.textTheme.bodySmall,
+                      ),
+                    ),
+                    TextButton(
+                      onPressed: _service.clearPortMigrated,
+                      child: const Text('知道了'),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          if (_service.portMigrated) const SizedBox(height: 12),
+
           // 服务总开关
           Card(
             child: SwitchListTile(
               title: const Text('对外提供大模型服务'),
               subtitle: Text(
-                running ? _service.baseUrl : '关闭中',
+                running
+                    ? '监听 0.0.0.0:${_service.port}（局域网可访问）'
+                    : '关闭中',
                 style: TextStyle(
                   color: running ? Colors.green : theme.hintColor,
                   fontWeight: FontWeight.w500,
@@ -186,13 +314,7 @@ class _ApiServerScreenState extends State<ApiServerScreen> {
                         tooltip: '复制',
                         onPressed: _keyController.text.isEmpty
                             ? null
-                            : () {
-                                Clipboard.setData(
-                                    ClipboardData(text: _keyController.text));
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(content: Text('已复制')),
-                                );
-                              },
+                            : () => _copy(_keyController.text, ' API Key'),
                       ),
                     ],
                   ),
@@ -244,7 +366,8 @@ class _ApiServerScreenState extends State<ApiServerScreen> {
                           keyboardType: TextInputType.number,
                           enabled: !running,
                           decoration: const InputDecoration(
-                            labelText: '监听端口（1024~65535）',
+                            labelText:
+                                '监听端口（${ApiServerService.minPort}~${ApiServerService.maxPort}）',
                             isDense: true,
                           ),
                         ),
@@ -263,24 +386,32 @@ class _ApiServerScreenState extends State<ApiServerScreen> {
 
           const SizedBox(height: 16),
 
-          // 接入信息
-          const _SectionTitle('接入信息（其他 App 填这些）'),
+          // 接入信息（三期 §3.2：多 IP 全列出，WiFi 优先）
+          const _SectionTitle('接入信息（其他设备/应用填这些）'),
           Card(
             child: Padding(
               padding: const EdgeInsets.all(16),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  _infoRow(context, 'Base URL', _service.baseUrl),
-                  _infoRow(context, 'OpenAI 兼容',
-                      'POST ${_service.baseUrl}/v1/chat/completions'),
-                  _infoRow(context, '模型列表',
-                      'GET ${_service.baseUrl}/v1/models'),
-                  _infoRow(context, 'Anthropic 兼容',
-                      'POST ${_service.baseUrl}/v1/messages'),
+                  if (addresses.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 4),
+                      child: Text(
+                        '未连接网络，仅限本机访问',
+                        style: theme.textTheme.bodySmall
+                            ?.copyWith(color: theme.hintColor),
+                      ),
+                    ),
+                  for (final addr in addresses)
+                    _addressRow(context, addr),
+                  _addressRow(
+                    context,
+                    AccessAddress('127.0.0.1', '本机'),
+                  ),
                   const Divider(),
                   Text(
-                    '仅本机（127.0.0.1）可访问，不对局域网暴露；'
+                    '局域网内任何设备都可尝试连接，API Key 是唯一防线；'
                     '模型名从模型列表接口获取，请求未安装的模型将返回 404。',
                     style: theme.textTheme.bodySmall?.copyWith(
                       color: theme.hintColor,
@@ -319,30 +450,97 @@ class _ApiServerScreenState extends State<ApiServerScreen> {
               ),
             ),
           ),
+
+          // 保活引导卡片（三期 §4.1：非必须，可永久关闭）
+          if (guideVisible) ...[
+            const SizedBox(height: 16),
+            const _SectionTitle('保活建议（非必须）'),
+            Card(
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      children: [
+                        Icon(
+                          _ignoringBattery ? Icons.check_circle : Icons.battery_alert,
+                          size: 18,
+                          color: _ignoringBattery ? Colors.green : Colors.orange,
+                        ),
+                        const SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            _ignoringBattery ? '已忽略电池优化' : '建议忽略电池优化',
+                            style: theme.textTheme.bodyMedium,
+                          ),
+                        ),
+                        if (!_ignoringBattery)
+                          TextButton(
+                            onPressed: _requestBatteryOptimization,
+                            child: const Text('一键设置'),
+                          ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      _autostartHint,
+                      style: theme.textTheme.bodySmall
+                          ?.copyWith(color: theme.hintColor),
+                    ),
+                    if (!_notificationsEnabled) ...[
+                      const SizedBox(height: 8),
+                      Text(
+                        '通知权限已禁用：保活不受影响，仅无运行状态通知',
+                        style: theme.textTheme.bodySmall?.copyWith(
+                          color: theme.hintColor,
+                        ),
+                      ),
+                    ],
+                    Align(
+                      alignment: Alignment.centerRight,
+                      child: TextButton(
+                        onPressed: _hideGuideForever,
+                        child: const Text('不再提示'),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ],
         ],
       ),
     );
   }
 
-  Widget _infoRow(BuildContext context, String label, String value) {
+  Widget _addressRow(BuildContext context, AccessAddress addr) {
     final theme = Theme.of(context);
+    final url = 'http://${addr.ip}:${_service.port}/v1';
     return Padding(
       padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
-        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           SizedBox(
-            width: 100,
-            child: Text(label,
-                style: theme.textTheme.bodySmall
-                    ?.copyWith(color: theme.hintColor)),
+            width: 60,
+            child: Text(
+              addr.lanReachable ? addr.label : '${addr.label}(不可达)',
+              style: theme.textTheme.bodySmall?.copyWith(color: theme.hintColor),
+            ),
           ),
           Expanded(
             child: SelectableText(
-              value,
-              style: theme.textTheme.bodySmall
-                  ?.copyWith(fontWeight: FontWeight.w500),
+              url,
+              style: theme.textTheme.bodySmall?.copyWith(
+                fontWeight: FontWeight.w500,
+                color: addr.lanReachable ? null : theme.hintColor,
+              ),
             ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.copy, size: 18),
+            tooltip: '复制',
+            onPressed: () => _copy(url, '接入地址'),
           ),
         ],
       ),
