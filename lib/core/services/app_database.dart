@@ -16,7 +16,7 @@ class AppDatabase {
 
   Database? _db;
 
-  static const int _dbVersion = 1;
+  static const int _dbVersion = 2;
 
   Future<Database> get database async {
     _db ??= await _open();
@@ -66,9 +66,17 @@ class AppDatabase {
             output_tokens INTEGER,
             request_body TEXT,
             response_body TEXT,
-            created_at INTEGER NOT NULL
+            created_at INTEGER NOT NULL,
+            source_ip TEXT
           )
         ''');
+      },
+      onUpgrade: (db, oldVersion, newVersion) async {
+        if (oldVersion < 2) {
+          // 三期：局域网开放后记录调用来源 IP（ADR-0003 配套）
+          await db.execute(
+              'ALTER TABLE api_call_logs ADD COLUMN source_ip TEXT');
+        }
       },
     );
   }

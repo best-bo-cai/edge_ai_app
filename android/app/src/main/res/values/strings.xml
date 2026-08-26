@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- API 服务保活通知（三期需求 §2.2） -->
+    <string name="keepalive_channel_name">API 服务运行</string>
+    <string name="keepalive_channel_desc">API 服务保活所需的常驻通知</string>
+    <string name="keepalive_notification_title">API 服务运行中</string>
+    <string name="keepalive_notification_text">局域网接入：%1$s:%2$d（点击回到应用）</string>
+</resources>

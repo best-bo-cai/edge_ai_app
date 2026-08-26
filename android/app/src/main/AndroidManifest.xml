@@ -1,5 +1,12 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- 三期保活：API 服务开启期间以前台服务保活（需求 §2.2） -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+    <!-- Android 13+ 通知运行时权限（拒绝时服务照常运行，仅无可见通知） -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <!-- 三期引导：检测并申请忽略电池优化（非必须，用户可拒绝） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
     <application
         android:label="edge_ai_app"
         android:name="${applicationName}"
@@ -31,6 +38,16 @@
         <meta-data
             android:name="flutterEmbedding"
             android:value="2" />
+        <!-- 三期保活：API 服务前台服务（specialUse：本地 LLM API 服务器，
+             规避 dataSync 在 Android 15+ 的 6 小时/天限时） -->
+        <service
+            android:name=".ApiKeepAliveService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="local LLM inference API server" />
+        </service>
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and

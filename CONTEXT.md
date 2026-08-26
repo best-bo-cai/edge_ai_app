@@ -26,7 +26,11 @@
 
 ## API 服务（API Service）
 
-内嵌于 App、监听 127.0.0.1 的本地 HTTP 服务，向手机上其他 app 提供 OpenAI / Anthropic 兼容接口。由用户手动开关，开启时以 Android 前台服务保活。
+内嵌于 App 的本地 HTTP 服务，向手机上其他 app 与局域网内其他设备提供 OpenAI / Anthropic 兼容接口。由用户手动开关，开启时监听所有网络接口、以 Android 前台服务保活。
+
+## 接入地址（Access URL）
+
+调用方配置 `base_url` 用的完整地址（`http://<IP>:<端口>/v1`）。手机可能同时持有多个 IP（WiFi、热点、蜂窝），接入地址按接口逐一列出，WiFi 优先。
 
 ## API 调用日志（API Call Log）
 

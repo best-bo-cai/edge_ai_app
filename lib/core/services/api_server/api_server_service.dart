@@ -1,25 +1,45 @@
 // lib/core/services/api_server/api_server_service.dart
-// 本地大模型 API 服务（二期，需求文档 §5）：
-// - HttpServer 绑定 127.0.0.1（ADR-0001：仅 loopback，不对局域网暴露）
+// 本地大模型 API 服务（二期 §5 + 三期保活与局域网访问）：
+// - HttpServer 绑定 0.0.0.0（ADR-0003：局域网开放，API key 为唯一防线）
 // - 兼容 OpenAI /v1/chat/completions 与 Anthropic /v1/messages（均支持 SSE 流式）
 // - API key 鉴权：Bearer（OpenAI 风格）与 x-api-key（Anthropic 风格）均接受
 // - 模型严格匹配：请求的 model 未命中本地模型时返回 404（ADR-0002）
 // - 推理经 InferenceScheduler 排队，与 App 内对话互斥，不打断进行中的生成
-// - 完整请求/响应落 api_call_logs（需求文档 §5.6，含 token 统计）
+// - 完整请求/响应落 api_call_logs（含 token 统计与来源 IP）
+// - 端口限制 49152~65535（动态端口段，默认 52415）；存量端口自动迁移
+// - 接入地址：枚举全部非 loopback IPv4，WiFi > 热点 > VPN > 蜂窝 优先级排序
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../app_database.dart';
 import '../model_service.dart';
+import '../keepalive/keepalive_service.dart';
 import 'inference_scheduler.dart';
 import 'openai_handlers.dart';
 import 'anthropic_handlers.dart';
 
 /// 服务运行状态
 enum ApiServerStatus { stopped, running, error }
+
+/// 一条局域网接入地址（接口 IP + 网络类型标注）
+class AccessAddress {
+  final String ip;
+  final String label; // WiFi / 热点 / VPN / 蜂窝
+  final bool lanReachable; // 局域网设备是否可达（蜂窝=false，运营商 NAT）
+
+  /// 排序优先级（WiFi 0 < 热点 1 < VPN 2 < 蜂窝 3 < 其他 4）
+  int _priority = 4;
+
+  AccessAddress(this.ip, this.label, {this.lanReachable = true});
+
+  /// 调用方 SDK 的 base_url 值
+  String get url => 'http://$ip:${ApiServerService.instance.port}/v1';
+}
 
 /// API 服务（单例 ChangeNotifier：状态变化广播给设置页）
 class ApiServerService extends ChangeNotifier {
@@ -29,7 +49,11 @@ class ApiServerService extends ChangeNotifier {
   static const String _prefEnabled = 'api_server_enabled';
   static const String _prefPort = 'api_server_port';
   static const String _prefApiKey = 'api_server_api_key';
-  static const int defaultPort = 8080;
+
+  /// 三期端口策略：IANA 动态/私有端口段（ADR-0003 对放弃 TLS 的部分补偿）
+  static const int minPort = 49152;
+  static const int maxPort = 65535;
+  static const int defaultPort = 52415;
 
   /// 日志表单字段截断上限（防超大响应撑爆库）
   static const int _logFieldLimit = 4000;
@@ -41,9 +65,17 @@ class ApiServerService extends ChangeNotifier {
   int _port = defaultPort;
   String _apiKey = '';
 
+  /// 端口迁移一次性提示（init 时检测到存量端口越界置位，UI 消费后清除）
+  bool _portMigrated = false;
+
+  /// 当前接入地址列表（网络变化/页面刷新时重查）
+  List<AccessAddress> _addresses = [];
+
   /// 调用统计（进程内累计；明细见 api_call_logs 表）
   int _totalCalls = 0;
   int _failedCalls = 0;
+
+  StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
   final ModelService _modelService = ModelService();
   final InferenceScheduler _scheduler = InferenceScheduler();
@@ -55,16 +87,47 @@ class ApiServerService extends ChangeNotifier {
   bool get isRunning => _status == ApiServerStatus.running;
   int get totalCalls => _totalCalls;
   int get failedCalls => _failedCalls;
+  bool get portMigrated => _portMigrated;
+  List<AccessAddress> get addresses => _addresses;
   String get baseUrl => 'http://127.0.0.1:$_port';
 
-  /// App 启动时恢复：读取配置；若退出前服务开着则自动重启
+  /// App 启动时恢复：读取配置；若退出前服务开着则自动重启。
+  /// 存量端口不在 49152~65535 内时自动迁移为默认端口（需求 §3.3）。
   Future<void> init() async {
     final prefs = await SharedPreferences.getInstance();
-    _port = prefs.getInt(_prefPort) ?? defaultPort;
-    _apiKey = prefs.getString(_prefApiKey) ?? '';
-    if (prefs.getBool(_prefEnabled) == true && _apiKey.isNotEmpty) {
-      await start(autoRestart: true);
+    final saved = prefs.getInt(_prefPort);
+    if (saved == null) {
+      _port = defaultPort;
+    } else if (saved < minPort || saved > maxPort) {
+      _port = defaultPort;
+      _portMigrated = true;
+      await prefs.setInt(_prefPort, _port);
+      debugPrint('ApiServer: port $saved out of range, migrated to $_port');
+    } else {
+      _port = saved;
     }
+    _apiKey = prefs.getString(_prefApiKey) ?? '';
+    await refreshAddresses();
+    // 网络连通性变化 → 重查接入地址（IP 可能变化）。
+    // try 保护单测环境（无插件实现时 MissingPluginException 不影响主流程）
+    try {
+      _connectivitySub ??= Connectivity().onConnectivityChanged.listen(
+            (_) => refreshAddresses(),
+            onError: (Object e) =>
+                debugPrint('ApiServer connectivity watch error: $e'),
+          );
+    } catch (e) {
+      debugPrint('ApiServer connectivity watch unavailable: $e');
+    }
+    if (prefs.getBool(_prefEnabled) == true && _apiKey.isNotEmpty) {
+      await start();
+    }
+  }
+
+  /// UI 消费迁移提示后清除
+  void clearPortMigrated() {
+    _portMigrated = false;
+    notifyListeners();
   }
 
   Future<void> setPort(int port) async {
@@ -72,6 +135,7 @@ class ApiServerService extends ChangeNotifier {
     _port = port;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setInt(_prefPort, port);
+    await refreshAddresses(); // URL 含端口，同步刷新
     notifyListeners();
   }
 
@@ -82,8 +146,8 @@ class ApiServerService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 启动服务。autoRestart=true 为开机自启场景（失败静默记录，不打扰用户）。
-  Future<void> start({bool autoRestart = false}) async {
+  /// 启动服务（含自动恢复场景：失败记录 lastError，由 UI 决定是否展示）。
+  Future<void> start() async {
     if (isRunning) return;
     if (_apiKey.isEmpty) {
       _status = ApiServerStatus.error;
@@ -93,7 +157,7 @@ class ApiServerService extends ChangeNotifier {
     }
     try {
       _server = await HttpServer.bind(
-        InternetAddress.loopbackIPv4, // ADR-0001：仅本机访问
+        InternetAddress.anyIPv4, // ADR-0003：监听所有接口，局域网可访问
         _port,
       );
       _server!.listen(_handleConnection, onError: (e) {
@@ -103,13 +167,42 @@ class ApiServerService extends ChangeNotifier {
       _lastError = null;
       final prefs = await SharedPreferences.getInstance();
       await prefs.setBool(_prefEnabled, true);
-      debugPrint('ApiServer: listening on $baseUrl');
+      debugPrint('ApiServer: listening on 0.0.0.0:$_port');
+      // 前台服务保活（三期 §2）：与 HTTP 服务生命周期严格绑定。
+      // - 用户开关/打开 App 场景：App 在前台，可正常拉起（打开 App 时
+      //   init() 自动恢复路径同样在前台执行）
+      // - Service 自愈的后台引擎场景：channel 未注册 → MissingPluginException
+      //   被 KeepAliveService 捕获吞掉，此时 FGS 本就在运行，无需重复拉起
+      final primary = _addresses.where((a) => a.lanReachable).firstOrNull;
+      unawaited(KeepAliveService.startService(
+        port: _port,
+        address: primary?.ip ?? '127.0.0.1',
+      ));
     } catch (e) {
       _status = ApiServerStatus.error;
-      _lastError = '端口 $_port 绑定失败：$e';
+      if (_isAddressInUse(e)) {
+        _lastError = '端口 $_port 被占用，请停止服务后更换端口';
+      } else {
+        _lastError = '服务启动失败：$e';
+      }
       debugPrint('ApiServer start failed: $e');
     }
     notifyListeners();
+  }
+
+  /// 端口占用判断：当前 Dart SDK 已移除 `AddressInUseException` 类型，
+  /// 统一按 `SocketException` 的 errno 判断 EADDRINUSE
+  /// （Linux/Android=98，macOS/iOS=48，Windows WSAEADDRINUSE=10048），
+  /// osError 缺失时按消息兜底。
+  static bool _isAddressInUse(Object e) {
+    if (e is SocketException) {
+      final code = e.osError?.errorCode;
+      if (code == 98 || code == 48 || code == 10048) return true;
+      final msg = e.message.toLowerCase();
+      return msg.contains('eaddrinuse') ||
+          msg.contains('address already in use');
+    }
+    return false;
   }
 
   Future<void> stop() async {
@@ -117,9 +210,59 @@ class ApiServerService extends ChangeNotifier {
     _server = null;
     _status = ApiServerStatus.stopped;
     _lastError = null;
+    // 前台服务与 HTTP 服务生命周期严格绑定（三期 §2.1）
+    await KeepAliveService.stopService();
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool(_prefEnabled, false);
     notifyListeners();
+  }
+
+  // ---------- 接入地址（三期 §3.2） ----------
+
+  /// 枚举全部非 loopback IPv4 地址，按 WiFi > 热点 > VPN > 蜂窝 排序。
+  /// 无任何可用地址（飞行模式等）时返回空列表，UI 兜底展示 127.0.0.1。
+  Future<void> refreshAddresses() async {
+    final list = <AccessAddress>[];
+    try {
+      final interfaces = await NetworkInterface.list(
+        includeLoopback: false,
+        type: InternetAddressType.IPv4,
+      );
+      for (final nic in interfaces) {
+        for (final addr in nic.addresses) {
+          final (label, reachable, priority) = _classifyInterface(nic.name);
+          list.add(AccessAddress(
+            addr.address,
+            label,
+            lanReachable: reachable,
+          ).._priority = priority);
+        }
+      }
+    } catch (e) {
+      debugPrint('ApiServer list interfaces failed: $e');
+    }
+    list.sort((a, b) => a._priority.compareTo(b._priority));
+    _addresses = list;
+    notifyListeners();
+  }
+
+  /// Android 网卡名启发式分类：wlan0=WiFi，ap0/swlan0/wlan1=热点，
+  /// tun/tap=VPN，rmnet/ccmni=蜂窝（运营商 NAT，局域网不可达）。
+  static (String, bool, int) _classifyInterface(String name) {
+    final n = name.toLowerCase();
+    if (n.startsWith('wlan0') || n.startsWith('eth')) {
+      return ('WiFi', true, 0);
+    }
+    if (n.startsWith('ap') || n.startsWith('swlan') || n.startsWith('wlan')) {
+      return ('热点', true, 1);
+    }
+    if (n.startsWith('tun') || n.startsWith('tap')) {
+      return ('VPN', true, 2);
+    }
+    if (n.startsWith('rmnet') || n.startsWith('ccmni') || n.startsWith('usb')) {
+      return ('蜂窝', false, 3);
+    }
+    return ('网络', true, 4);
   }
 
   // ---------- 连接处理 ----------
@@ -133,6 +276,7 @@ class ApiServerService extends ChangeNotifier {
     String? modelId;
     int? promptTokens;
     int? outputTokens;
+    final sourceIp = request.connectionInfo?.remoteAddress.address;
 
     try {
       // 鉴权（401 不透出模型信息）
@@ -223,6 +367,7 @@ class ApiServerService extends ChangeNotifier {
         requestBody: requestBody,
         responseBody: responseBody,
         elapsedMs: stopwatch.elapsedMilliseconds,
+        sourceIp: sourceIp,
       );
       notifyListeners(); // 刷新设置页统计
     }
@@ -268,6 +413,7 @@ class ApiServerService extends ChangeNotifier {
     required String requestBody,
     required String responseBody,
     required int elapsedMs,
+    String? sourceIp,
   }) async {
     try {
       final db = await AppDatabase().database;
@@ -281,6 +427,8 @@ class ApiServerService extends ChangeNotifier {
         'request_body': _truncate(requestBody),
         'response_body': _truncate(responseBody),
         'created_at': DateTime.now().millisecondsSinceEpoch,
+        // 三期（ADR-0003）：局域网开放后记录调用来源，便于发现异常调用
+        'source_ip': sourceIp,
       });
     } catch (e) {
       debugPrint('ApiServer log insert failed: $e');
