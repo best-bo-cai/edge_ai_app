@@ -367,7 +367,7 @@ class _ChatScreenState extends State<ChatScreen> {
         : '正在加载模型…';
     return Container(
       width: double.infinity,
-      color: Colors.blue.withValues(alpha: 0.08),
+      color: Colors.blue.withOpacity(0.08),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -392,11 +392,11 @@ class _ChatScreenState extends State<ChatScreen> {
                 ? LinearProgressIndicator(
                     value: p.clamp(0.0, 1.0),
                     minHeight: 4,
-                    backgroundColor: Colors.blue.withValues(alpha: 0.12),
+                    backgroundColor: Colors.blue.withOpacity(0.12),
                   )
                 : LinearProgressIndicator(
                     minHeight: 4,
-                    backgroundColor: Colors.blue.withValues(alpha: 0.12),
+                    backgroundColor: Colors.blue.withOpacity(0.12),
                   ),
           ),
         ],
@@ -412,7 +412,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }) {
     return Container(
       width: double.infinity,
-      color: color.withValues(alpha: 0.08),
+      color: color.withOpacity(0.08),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Row(
         children: [
@@ -625,7 +625,7 @@ class _ChatScreenState extends State<ChatScreen> {
         color: Colors.white,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withValues(alpha: 0.1),
+            color: Colors.black.withOpacity(0.1),
             blurRadius: 8,
             offset: const Offset(0, -2),
           ),
