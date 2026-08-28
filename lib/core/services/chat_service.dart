@@ -2,6 +2,7 @@
 import 'dart:async';
 
 import '../engine/llama_engine.dart';
+import '../engine/think_stream_splitter.dart';
 import '../models/message.dart';
 import '../models/model_params.dart';
 import 'conversation_service.dart';
@@ -170,37 +171,39 @@ class ChatService {
       final params = _paramsService.paramsOf(targetModelId ?? '');
 
       try {
-        yield* _streamWithHistoryUpdate(_engine.generate(
+        yield* _streamWithHistoryUpdate(splitThinkStream(_engine.generate(
           _buildPrompt(params.systemPrompt),
           maxTokens: params.maxTokens,
           topK: params.topK.toDouble(),
           topP: params.topP,
           temperature: params.temperature,
           repeatPenalty: params.repeatPenalty,
-        ));
+        )));
       } on Exception catch (e) {
         // 上下文溢出：丢弃最旧一半历史后重试一次
         if (e.toString().contains('context window')) {
           _trimHistory(halve: true);
-          yield* _streamWithHistoryUpdate(_engine.generate(
+          yield* _streamWithHistoryUpdate(splitThinkStream(_engine.generate(
             _buildPrompt(params.systemPrompt),
             maxTokens: params.maxTokens,
             topK: params.topK.toDouble(),
             topP: params.topP,
             temperature: params.temperature,
             repeatPenalty: params.repeatPenalty,
-          ));
+          )));
         } else {
           rethrow;
         }
       }
     } finally {
       _finalizeStreamingMessage();
-      // assistant 消息整体落库（含中止时的部分内容，需求文档 §2.2）
+      // assistant 消息整体落库（含思考与正文，需求文档 §2.4）
       final last = _messageHistory.isEmpty ? null : _messageHistory.last;
-      if (last != null && last.role == MessageRole.assistant && last.content.isNotEmpty) {
+      if (last != null &&
+          last.role == MessageRole.assistant &&
+          (last.content.isNotEmpty || last.reasoning.isNotEmpty)) {
         await _conversationService.appendAssistantMessage(last.content,
-            conversationId: conversationId);
+            reasoning: last.reasoning, conversationId: conversationId);
       }
       _isGenerating = false;
       gate.release();
@@ -218,6 +221,7 @@ class ChatService {
   /// API 推理通道（二期）：无会话副作用的流式生成。
   /// - 独立于 App 内时间线（不写 _messageHistory / 不落库）
   /// - 由 InferenceScheduler 持锁调用，与 sendMessage 互斥
+  /// - 四期：token 流经 think 分流，响应天然不含 think 标签（需求 §8）
   Stream<String> generateRaw(
     String prompt, {
     required String modelId,
@@ -240,14 +244,15 @@ class ChatService {
       }
 
       final params = _paramsService.paramsOf(modelId);
-      yield* _engine.generate(
+      // API 通道：丢弃思考增量，只透传正文（协议响应不含思考内容）
+      yield* splitThinkStream(_engine.generate(
         prompt,
         maxTokens: maxTokens ?? params.maxTokens,
         topK: topK ?? params.topK.toDouble(),
         topP: topP ?? params.topP,
         temperature: temperature ?? params.temperature,
         repeatPenalty: repeatPenalty ?? params.repeatPenalty,
-      );
+      )).map((e) => e.contentDelta);
     } finally {
       gate.release();
     }
@@ -283,18 +288,24 @@ class ChatService {
     _engine.abort();
   }
 
-  /// 流式转发并同步更新历史中的助手消息内容
-  Stream<String> _streamWithHistoryUpdate(Stream<String> source) async* {
-    String accumulated = '';
-    await for (final token in source) {
-      accumulated += token;
+  /// 流式转发并同步更新历史中的助手消息（思考/正文双字段，四期 §2.2）
+  Stream<String> _streamWithHistoryUpdate(
+      Stream<ThinkSplitEvent> source) async* {
+    String reasoning = '';
+    String content = '';
+    await for (final event in source) {
+      reasoning += event.reasoningDelta;
+      content += event.contentDelta;
       final lastIndex = _messageHistory.length - 1;
       if (lastIndex >= 0) {
         _messageHistory[lastIndex] = _messageHistory[lastIndex].copyWith(
-          content: accumulated,
+          reasoning: reasoning,
+          content: content,
         );
       }
-      yield token;
+      // 对外产出事件（UI 流式刷新驱动）：思考阶段正文增量为空字符串，
+      // 事件本身仍需产出——否则 await for 不触发 setState，思考内容不实时显示
+      yield event.contentDelta;
     }
   }
 

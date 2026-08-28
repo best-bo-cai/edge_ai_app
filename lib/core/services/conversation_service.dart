@@ -202,12 +202,13 @@ class ConversationService extends ChangeNotifier {
         limit: pageSize);
     _currentMessages = rows
         .reversed
-        .map((r) => ChatMessage(
+        .map((r) => ChatMessage.splitLegacy(ChatMessage(
               id: r['id'] as String,
               role: MessageRole.values.firstWhere((e) => e.name == r['role']),
               content: r['content'] as String,
               timestamp: DateTime.fromMillisecondsSinceEpoch(r['created_at'] as int),
-            ))
+              reasoning: r['reasoning'] as String? ?? '',
+            )))
         .toList();
   }
 
@@ -226,12 +227,13 @@ class ConversationService extends ChangeNotifier {
         limit: pageSize);
     final earlier = rows
         .reversed
-        .map((r) => ChatMessage(
+        .map((r) => ChatMessage.splitLegacy(ChatMessage(
               id: r['id'] as String,
               role: MessageRole.values.firstWhere((e) => e.name == r['role']),
               content: r['content'] as String,
               timestamp: DateTime.fromMillisecondsSinceEpoch(r['created_at'] as int),
-            ))
+              reasoning: r['reasoning'] as String? ?? '',
+            )))
         .toList();
     _currentMessages = [...earlier, ..._currentMessages];
     notifyListeners();
@@ -302,16 +304,17 @@ class ConversationService extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// 追加助手消息（生成结束/中止时整体落库，需求文档 §2.2）
-  Future<void> appendAssistantMessage(String content, {String? conversationId}) async {
+  /// 追加助手消息（生成结束/中止时整体落库，需求文档 §2.2/§2.4）
+  Future<void> appendAssistantMessage(String content,
+      {String? conversationId, String reasoning = ''}) async {
     final conv = _targetConversation(conversationId);
-    if (conv == null || content.isEmpty) return;
-    final msg = ChatMessage.assistant(content);
+    if (conv == null || (content.isEmpty && reasoning.isEmpty)) return;
+    final msg = ChatMessage.assistant(content, reasoning: reasoning);
     await _insertMessage(conv, msg);
     if (_current?.id == conv.id) {
       _currentMessages = [..._currentMessages, msg];
     }
-    await _updateSummary(conv, content);
+    await _updateSummary(conv, content.isEmpty ? reasoning : content);
     notifyListeners();
   }
 
@@ -332,6 +335,8 @@ class ConversationService extends ChangeNotifier {
       'conversation_id': conv.id,
       'role': msg.role.name,
       'content': msg.content,
+      // 四期 §2.4：思考内容独立落库（旧版混合存储由读取侧懒拆分兜底）
+      if (msg.reasoning.isNotEmpty) 'reasoning': msg.reasoning,
       'created_at': DateTime.now().millisecondsSinceEpoch,
     });
   }

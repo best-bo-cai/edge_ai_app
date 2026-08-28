@@ -24,7 +24,9 @@ android {
         applicationId = "com.example.edge_ai_app"
         // You can update the following values to match your application needs.
         // For more information, see: https://flutter.dev/to/review-gradle-config.
-        minSdk = flutter.minSdkVersion
+        // llama.cpp 的 posix_madvise / POSIX_MADV_* 需 API 23+（NDK 头文件按 API 门控），
+        // 使用 Flutter 默认 minSdk 21 会导致 Native 编译报 undeclared identifier
+        minSdk = 23
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName

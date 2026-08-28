@@ -1,5 +1,6 @@
 // lib/features/chat/chat_screen.dart
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import '../../core/services/chat_service.dart';
 import '../../core/services/conversation_service.dart';
 import '../../core/models/message.dart';
@@ -366,7 +367,7 @@ class _ChatScreenState extends State<ChatScreen> {
         : '正在加载模型…';
     return Container(
       width: double.infinity,
-      color: Colors.blue.withValues(alpha: 0.08),
+      color: Colors.blue.withOpacity(0.08),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Column(
         mainAxisSize: MainAxisSize.min,
@@ -391,11 +392,11 @@ class _ChatScreenState extends State<ChatScreen> {
                 ? LinearProgressIndicator(
                     value: p.clamp(0.0, 1.0),
                     minHeight: 4,
-                    backgroundColor: Colors.blue.withValues(alpha: 0.12),
+                    backgroundColor: Colors.blue.withOpacity(0.12),
                   )
                 : LinearProgressIndicator(
                     minHeight: 4,
-                    backgroundColor: Colors.blue.withValues(alpha: 0.12),
+                    backgroundColor: Colors.blue.withOpacity(0.12),
                   ),
           ),
         ],
@@ -411,7 +412,7 @@ class _ChatScreenState extends State<ChatScreen> {
   }) {
     return Container(
       width: double.infinity,
-      color: color.withValues(alpha: 0.08),
+      color: color.withOpacity(0.08),
       padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
       child: Row(
         children: [
@@ -524,37 +525,49 @@ class _ChatScreenState extends State<ChatScreen> {
             const SizedBox(width: 8),
           ],
           Flexible(
-            child: Container(
-              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-              decoration: BoxDecoration(
-                color: isUser ? Colors.blue : Colors.grey[200],
-                borderRadius: BorderRadius.circular(16),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    message.content.isEmpty && message.isStreaming ? '…' : message.content,
-                    style: TextStyle(
-                      color: isUser ? Colors.white : Colors.black87,
-                      fontSize: 16,
-                      height: 1.5,
-                    ),
-                  ),
-                  if (message.isStreaming) ...[
-                    const SizedBox(height: 8),
-                    SizedBox(
-                      width: 16,
-                      height: 16,
-                      child: CircularProgressIndicator(
-                        strokeWidth: 2,
-                        valueColor: AlwaysStoppedAnimation<Color>(
-                          isUser ? Colors.white : Colors.blue,
-                        ),
+            child: GestureDetector(
+              // 四期 §3：仅 assistant 气泡长按弹复制菜单（复制正文，不含思考）
+              onLongPressStart: isUser
+                  ? null
+                  : (_) => _showCopyMenu(message),
+              child: Container(
+                padding:
+                    const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+                decoration: BoxDecoration(
+                  color: isUser ? Colors.blue : Colors.grey[200],
+                  borderRadius: BorderRadius.circular(16),
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // 思考内容折叠区（四期 §4：生成中展开，完成后收起）
+                    if (!isUser && message.reasoning.isNotEmpty)
+                      _ThinkBlock(message: message),
+                    Text(
+                      message.content.isEmpty && message.isStreaming
+                          ? (message.reasoning.isEmpty ? '…' : '')
+                          : message.content,
+                      style: TextStyle(
+                        color: isUser ? Colors.white : Colors.black87,
+                        fontSize: 16,
+                        height: 1.5,
                       ),
                     ),
+                    if (message.isStreaming) ...[
+                      const SizedBox(height: 8),
+                      SizedBox(
+                        width: 16,
+                        height: 16,
+                        child: CircularProgressIndicator(
+                          strokeWidth: 2,
+                          valueColor: AlwaysStoppedAnimation<Color>(
+                            isUser ? Colors.white : Colors.blue,
+                          ),
+                        ),
+                      ),
+                    ],
                   ],
-                ],
+                ),
               ),
             ),
           ),
@@ -570,6 +583,41 @@ class _ChatScreenState extends State<ChatScreen> {
     );
   }
 
+  /// assistant 气泡长按菜单（四期 §3.1：复制正文；正文为空时置灰）
+  void _showCopyMenu(ChatMessage message) {
+    final canCopy = message.content.trim().isNotEmpty;
+    showModalBottomSheet<void>(
+      context: context,
+      builder: (ctx) => SafeArea(
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              leading: const Icon(Icons.copy),
+              title: const Text('复制正文'),
+              subtitle: message.reasoning.isEmpty
+                  ? null
+                  : const Text('不含思考内容', style: TextStyle(fontSize: 12)),
+              enabled: canCopy,
+              onTap: canCopy
+                  ? () {
+                      Clipboard.setData(
+                          ClipboardData(text: message.content));
+                      Navigator.pop(ctx);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                            content: Text('已复制'),
+                            duration: Duration(seconds: 1)),
+                      );
+                    }
+                  : null,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   Widget _buildInputArea() {
     return Container(
       padding: const EdgeInsets.all(16),
@@ -577,7 +625,7 @@ class _ChatScreenState extends State<ChatScreen> {
         color: Colors.white,
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withValues(alpha: 0.1),
+            color: Colors.black.withOpacity(0.1),
             blurRadius: 8,
             offset: const Offset(0, -2),
           ),
@@ -639,4 +687,104 @@ class _ChatScreenState extends State<ChatScreen> {
     _scrollController.dispose();
     super.dispose();
   }
+}
+
+/// 思考内容折叠块（四期 §4）：
+/// - 生成中（isStreaming）：默认展开，标题显示「思考中…」
+/// - 生成完成：自动收起，标题「已深度思考」，点击切换展开/收起
+/// - 折叠状态仅存 UI 内存，不持久化（重进会话恢复默认收起）
+class _ThinkBlock extends StatefulWidget {
+  final ChatMessage message;
+  const _ThinkBlock({required this.message});
+
+  @override
+  State<_ThinkBlock> createState() => _ThinkBlockState();
+}
+
+class _ThinkBlockState extends State<_ThinkBlock> {
+  bool _expanded = false;
+
+  @override
+  void didUpdateWidget(covariant _ThinkBlock oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // 生成结束 → 自动收起（需求 §4.1：完成后自动收起，点开可回看）
+    if (oldWidget.message.isStreaming && !widget.message.isStreaming) {
+      _expanded = false;
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final message = widget.message;
+    final streaming = message.isStreaming;
+    // 生成中默认展开：streaming 态视为展开（用户无需点击）
+    final expanded = streaming || _expanded;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // 标题行：点击切换（生成中点击无效果，始终展开）
+          InkWell(
+            onTap: streaming ? null : _toggle,
+            borderRadius: BorderRadius.circular(4),
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(
+                    Icons.psychology,
+                    size: 14,
+                    color: Colors.blueGrey[400],
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    streaming ? '思考中…' : '已深度思考',
+                    style: TextStyle(
+                      fontSize: 12,
+                      color: Colors.blueGrey[400],
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  if (!streaming)
+                    Icon(
+                      _expanded
+                          ? Icons.keyboard_arrow_up
+                          : Icons.keyboard_arrow_down,
+                      size: 14,
+                      color: Colors.blueGrey[400],
+                    ),
+                ],
+              ),
+            ),
+          ),
+          if (expanded)
+            Padding(
+              padding: const EdgeInsets.only(left: 4, right: 4, top: 2),
+              child: Text(
+                message.reasoning,
+                style: TextStyle(
+                  fontSize: 13,
+                  height: 1.4,
+                  color: Colors.blueGrey[600],
+                ),
+              ),
+            ),
+          // 思考区与正文之间的分隔线（仅完成态显示，避免生成中视觉噪音）
+          if (!streaming)
+            Padding(
+              padding: const EdgeInsets.only(top: 4, bottom: 4),
+              child: Divider(
+                height: 1,
+                color: Colors.blueGrey[100],
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  void _toggle() => setState(() => _expanded = !_expanded);
 }
