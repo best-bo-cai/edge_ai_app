@@ -16,7 +16,7 @@ class AppDatabase {
 
   Database? _db;
 
-  static const int _dbVersion = 2;
+  static const int _dbVersion = 3;
 
   Future<Database> get database async {
     _db ??= await _open();
@@ -45,6 +45,7 @@ class AppDatabase {
             conversation_id TEXT NOT NULL,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
+            reasoning TEXT,
             created_at INTEGER NOT NULL
           )
         ''');
@@ -76,6 +77,10 @@ class AppDatabase {
           // 三期：局域网开放后记录调用来源 IP（ADR-0003 配套）
           await db.execute(
               'ALTER TABLE api_call_logs ADD COLUMN source_ip TEXT');
+        }
+        if (oldVersion < 3) {
+          // 四期：思考内容独立落库（旧数据由读取侧懒拆分兼容，不回填）
+          await db.execute('ALTER TABLE messages ADD COLUMN reasoning TEXT');
         }
       },
     );

@@ -1,6 +1,12 @@
 // lib/core/models/message.dart
 
 /// 聊天消息模型
+///
+/// 助手消息由「思考内容」与「正文」两部分组成（四期需求 §2.1）：
+/// - [reasoning]：思考内容（<think> 与 </think> 之间的推理过程），仅供查看
+/// - [content]：正文（</think> 之后），语义与旧版单一 content 字段一致
+///
+/// 旧版混合存储（think 标签原样在 content 里）由 [splitLegacy] 懒拆分兼容。
 class ChatMessage {
   final String id;
   final MessageRole role;
@@ -8,12 +14,16 @@ class ChatMessage {
   final DateTime timestamp;
   final bool isStreaming;
 
+  /// 思考内容（仅 assistant 消息可能有；空表示无思考）
+  final String reasoning;
+
   ChatMessage({
     required this.id,
     required this.role,
     required this.content,
     DateTime? timestamp,
     this.isStreaming = false,
+    this.reasoning = '',
   }) : timestamp = timestamp ?? DateTime.now();
 
   factory ChatMessage.user(String content) {
@@ -24,13 +34,24 @@ class ChatMessage {
     );
   }
 
-  factory ChatMessage.assistant(String content, {bool isStreaming = false}) {
+  factory ChatMessage.assistant(String content,
+      {bool isStreaming = false, String reasoning = ''}) {
     return ChatMessage(
       id: DateTime.now().millisecondsSinceEpoch.toString(),
       role: MessageRole.assistant,
       content: content,
       isStreaming: isStreaming,
+      reasoning: reasoning,
     );
+  }
+
+  /// 旧版混合存储懒拆分（四期需求 §2.3）：
+  /// content 含 think 标签时拆为 reasoning + content；否则原样返回。
+  static ChatMessage splitLegacy(ChatMessage msg) {
+    if (msg.role != MessageRole.assistant) return msg;
+    final parsed = ThinkSplitter.parse(msg.content);
+    if (parsed.reasoning.isEmpty) return msg;
+    return msg.copyWith(reasoning: parsed.reasoning, content: parsed.content);
   }
 
   ChatMessage copyWith({
@@ -39,6 +60,7 @@ class ChatMessage {
     String? content,
     DateTime? timestamp,
     bool? isStreaming,
+    String? reasoning,
   }) {
     return ChatMessage(
       id: id ?? this.id,
@@ -46,6 +68,7 @@ class ChatMessage {
       content: content ?? this.content,
       timestamp: timestamp ?? this.timestamp,
       isStreaming: isStreaming ?? this.isStreaming,
+      reasoning: reasoning ?? this.reasoning,
     );
   }
 
@@ -56,16 +79,54 @@ class ChatMessage {
       'content': content,
       'timestamp': timestamp.toIso8601String(),
       'isStreaming': isStreaming,
+      if (reasoning.isNotEmpty) 'reasoning': reasoning,
     };
   }
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
-    return ChatMessage(
+    final msg = ChatMessage(
       id: json['id'] as String,
       role: MessageRole.values.firstWhere((e) => e.name == json['role']),
       content: json['content'] as String,
       timestamp: DateTime.parse(json['timestamp'] as String),
       isStreaming: json['isStreaming'] as bool? ?? false,
+      reasoning: json['reasoning'] as String? ?? '',
+    );
+    return splitLegacy(msg);
+  }
+}
+
+/// think 标签解析结果
+class ThinkParseResult {
+  final String reasoning;
+  final String content;
+  const ThinkParseResult(this.reasoning, this.content);
+}
+
+/// <think>...</think> 标签一次性解析（懒拆分 / 单测用）。
+/// 与流式状态机 [ThinkStreamSplitter] 共享同一套标签语义。
+class ThinkSplitter {
+  // 相邻字符串字面量在编译期拼接（与 ThinkStreamSplitter 同一套标签语义）
+  static const String openTag = '<th' 'ink>';
+  static const String closeTag = '</th' 'ink>';
+
+  static ThinkParseResult parse(String text) {
+    final open = text.indexOf(openTag);
+    if (open < 0) return ThinkParseResult('', text);
+
+    // open 之前的正文保留（与流式状态机一致，不能丢弃）
+    final prefix = text.substring(0, open);
+
+    final close = text.indexOf(closeTag, open + openTag.length);
+    if (close < 0) {
+      // 未闭合：全部视为思考（生成中断场景）
+      return ThinkParseResult(
+          text.substring(open + openTag.length), prefix);
+    }
+    return ThinkParseResult(
+      text.substring(open + openTag.length, close),
+      // close 之后的后续同款标签按正文处理（§2.2 不二次切换）
+      prefix + text.substring(close + closeTag.length),
     );
   }
 }

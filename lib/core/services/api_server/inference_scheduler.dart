@@ -86,6 +86,8 @@ class InferenceScheduler {
     try {
       final stream = chatService.generateRaw(prompt, modelId: modelId);
       await for (final piece in stream) {
+        // 思考阶段产出空片段（驱动 UI 用）——API 通道过滤，不产生空 SSE chunk
+        if (piece.isEmpty) continue;
         buffer.write(piece);
         onToken?.call(piece);
       }
