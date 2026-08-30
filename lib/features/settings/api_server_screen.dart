@@ -14,6 +14,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../../core/services/api_server/api_server_service.dart';
 import '../../core/services/keepalive/keepalive_service.dart';
+import 'api_call_log_screen.dart';
 
 class ApiServerScreen extends StatefulWidget {
   const ApiServerScreen({super.key});
@@ -424,29 +425,39 @@ class _ApiServerScreenState extends State<ApiServerScreen>
 
           const SizedBox(height: 16),
 
-          // 调用统计
+          // 调用统计（整卡可点进入日志明细；数字从日志表聚合，与日志页一致）
           const _SectionTitle('调用统计'),
           Card(
-            child: Padding(
-              padding: const EdgeInsets.all(16),
-              child: Row(
-                children: [
-                  Expanded(
-                    child: _StatCell(
-                      label: '总调用',
-                      value: _service.totalCalls.toString(),
+            child: InkWell(
+              borderRadius: BorderRadius.circular(12),
+              onTap: () => Navigator.push(
+                context,
+                MaterialPageRoute<void>(
+                  builder: (_) => const ApiCallLogScreen(),
+                ),
+              ),
+              child: Padding(
+                padding: const EdgeInsets.all(16),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: _StatCell(
+                        label: '总调用',
+                        value: _service.totalCalls.toString(),
+                      ),
                     ),
-                  ),
-                  Expanded(
-                    child: _StatCell(
-                      label: '失败',
-                      value: _service.failedCalls.toString(),
-                      valueColor: _service.failedCalls > 0
-                          ? theme.colorScheme.error
-                          : null,
+                    Expanded(
+                      child: _StatCell(
+                        label: '失败',
+                        value: _service.failedCalls.toString(),
+                        valueColor: _service.failedCalls > 0
+                            ? theme.colorScheme.error
+                            : null,
+                      ),
                     ),
-                  ),
-                ],
+                    Icon(Icons.chevron_right, color: theme.hintColor),
+                  ],
+                ),
               ),
             ),
           ),

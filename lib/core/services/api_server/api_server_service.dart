@@ -15,6 +15,7 @@ import 'dart:io';
 import 'package:connectivity_plus/connectivity_plus.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite/sqflite.dart' show Sqflite;
 
 import '../app_database.dart';
 import '../model_service.dart';
@@ -71,9 +72,12 @@ class ApiServerService extends ChangeNotifier {
   /// 当前接入地址列表（网络变化/页面刷新时重查）
   List<AccessAddress> _addresses = [];
 
-  /// 调用统计（进程内累计；明细见 api_call_logs 表）
+  /// 调用统计（从 api_call_logs 表聚合，与日志页单一事实来源；失败口径：状态码 >= 400）
   int _totalCalls = 0;
   int _failedCalls = 0;
+
+  /// 日志 id 自增序号（防同微秒并发落库主键冲突）
+  int _logSeq = 0;
 
   StreamSubscription<List<ConnectivityResult>>? _connectivitySub;
 
@@ -107,6 +111,7 @@ class ApiServerService extends ChangeNotifier {
       _port = saved;
     }
     _apiKey = prefs.getString(_prefApiKey) ?? '';
+    await refreshStats(); // 统计从日志表聚合（DB 为单一事实来源，重启不归零）
     await refreshAddresses();
     // 网络连通性变化 → 重查接入地址（IP 可能变化）。
     // try 保护单测环境（无插件实现时 MissingPluginException 不影响主流程）
@@ -268,7 +273,6 @@ class ApiServerService extends ChangeNotifier {
   // ---------- 连接处理 ----------
 
   Future<void> _handleConnection(HttpRequest request) async {
-    _totalCalls++;
     final stopwatch = Stopwatch()..start();
     var statusCode = 500;
     var requestBody = '';
@@ -281,7 +285,6 @@ class ApiServerService extends ChangeNotifier {
     try {
       // 鉴权（401 不透出模型信息）
       if (!_authorize(request)) {
-        _failedCalls++;
         statusCode = 401;
         final resp = jsonEncode({
           'error': {'message': 'Invalid API key', 'type': 'authentication_error'},
@@ -332,7 +335,6 @@ class ApiServerService extends ChangeNotifier {
           break;
 
         default:
-          _failedCalls++;
           statusCode = 404;
           final resp = jsonEncode({
             'error': {'message': 'Not found: $path', 'type': 'invalid_request_error'},
@@ -342,9 +344,7 @@ class ApiServerService extends ChangeNotifier {
           return;
       }
 
-      if (statusCode >= 400) _failedCalls++;
     } catch (e) {
-      _failedCalls++;
       debugPrint('ApiServer handler error: $e');
       statusCode = 500;
       try {
@@ -369,6 +369,7 @@ class ApiServerService extends ChangeNotifier {
         elapsedMs: stopwatch.elapsedMilliseconds,
         sourceIp: sourceIp,
       );
+      await refreshStats(); // 统计与日志页同源（DB 聚合）
       notifyListeners(); // 刷新设置页统计
     }
   }
@@ -403,6 +404,22 @@ class ApiServerService extends ChangeNotifier {
     await response.close();
   }
 
+  /// 统计从日志表聚合（决策 2026-08-30：DB 为单一事实来源，与日志页严格一致；
+  /// 失败口径与 HTTP 语义一致：状态码 >= 400。存量 NULL 视为未知，不计入失败）
+  Future<void> refreshStats() async {
+    try {
+      final db = await AppDatabase().database;
+      _totalCalls = Sqflite.firstIntValue(
+              await db.rawQuery('SELECT COUNT(*) FROM api_call_logs')) ??
+          0;
+      _failedCalls = Sqflite.firstIntValue(await db.rawQuery(
+              'SELECT COUNT(*) FROM api_call_logs WHERE status_code >= 400')) ??
+          0;
+    } catch (e) {
+      debugPrint('ApiServer refresh stats failed: $e');
+    }
+  }
+
   /// 完整请求/响应落库（需求文档 §5.6：审计要求记录完整内容）
   Future<void> _logCall({
     required String endpoint,
@@ -418,9 +435,10 @@ class ApiServerService extends ChangeNotifier {
     try {
       final db = await AppDatabase().database;
       await db.insert('api_call_logs', {
-        'id': 'log_${DateTime.now().microsecondsSinceEpoch}_$_totalCalls',
+        'id': 'log_${DateTime.now().microsecondsSinceEpoch}_${_logSeq++}',
         'endpoint': endpoint,
         'model_id': modelId,
+        'status_code': statusCode,
         'prompt_tokens': promptTokens,
         'output_tokens': outputTokens,
         // 硬约束：记录完整请求与响应内容（超长截断保底防库膨胀）
