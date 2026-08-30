@@ -16,7 +16,7 @@ class AppDatabase {
 
   Database? _db;
 
-  static const int _dbVersion = 3;
+  static const int _dbVersion = 4;
 
   Future<Database> get database async {
     _db ??= await _open();
@@ -68,7 +68,8 @@ class AppDatabase {
             request_body TEXT,
             response_body TEXT,
             created_at INTEGER NOT NULL,
-            source_ip TEXT
+            source_ip TEXT,
+            status_code INTEGER
           )
         ''');
       },
@@ -81,6 +82,11 @@ class AppDatabase {
         if (oldVersion < 3) {
           // 四期：思考内容独立落库（旧数据由读取侧懒拆分兼容，不回填）
           await db.execute('ALTER TABLE messages ADD COLUMN reasoning TEXT');
+        }
+        if (oldVersion < 4) {
+          // 日志页：状态码落库（失败统计与列表成败标识的数据源）
+          await db.execute(
+              'ALTER TABLE api_call_logs ADD COLUMN status_code INTEGER');
         }
       },
     );
