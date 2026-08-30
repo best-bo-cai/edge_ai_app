@@ -259,14 +259,14 @@ class _StatusBadge extends StatelessWidget {
   Widget build(BuildContext context) {
     final code = statusCode;
     final (text, fg, bg) = switch (code) {
-      null => ('—', Colors.grey, Colors.grey.withValues(alpha: 0.15)),
-      >= 500 => ('$code', Colors.red, Colors.red.withValues(alpha: 0.12)),
+      null => ('—', Colors.grey, Colors.grey.withOpacity(0.15)),
+      >= 500 => ('$code', Colors.red, Colors.red.withOpacity(0.12)),
       >= 400 => (
         '$code',
         Colors.orange,
-        Colors.orange.withValues(alpha: 0.12)
+        Colors.orange.withOpacity(0.12)
       ),
-      _ => ('$code', Colors.green, Colors.green.withValues(alpha: 0.12)),
+      _ => ('$code', Colors.green, Colors.green.withOpacity(0.12)),
     };
     return Container(
       width: 42,
@@ -351,7 +351,7 @@ class _LogDetailPage extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
       decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
+        color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.5),
         borderRadius: BorderRadius.circular(6),
       ),
       child: Text.rich(
@@ -385,7 +385,7 @@ class _LogDetailPage extends StatelessWidget {
       width: double.infinity,
       padding: const EdgeInsets.all(12),
       decoration: BoxDecoration(
-        color: theme.colorScheme.surfaceContainerHighest.withValues(alpha: 0.4),
+        color: theme.colorScheme.surfaceContainerHighest.withOpacity(0.4),
         borderRadius: BorderRadius.circular(8),
       ),
       child: SelectableText(
